@@ -1,3 +1,3 @@
-# PostgreSQL детально
+# ROADMAP по репозиториям
 
-[Этап 1: Архитектура PostgreSQL](stage1/arch.md)
+[Документация по внутреннему устройству PostgreSQL](PostgreSQL/README.md)
