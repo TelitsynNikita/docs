@@ -164,12 +164,82 @@ data := struct {
 
 ---
 
+### 🖥️ Фронтенд: санитизация данных перед рендерингом в React/Angular
+
+Даже если бэкенд правильно экранирует данные через `html/template`, фронтенд может всё испортить. Когда React получает JSON с пользовательским контентом и вставляет его в DOM через `dangerouslySetInnerHTML`, никакого серверного экранирования уже нет — браузер парсит эту строку как HTML и выполняет все скрипты внутри.
+
+**React по умолчанию безопасен**
+
+JSX автоматически экранирует строки при вставке через фигурные скобки `{value}`. Следующий код безопасен:
+
+```jsx
+function Comment({ body }) {
+    // Безопасно: React экранирует <script> в &lt;script&gt;
+    return <div>{body}</div>;
+}
+```
+
+**Опасность `dangerouslySetInnerHTML`**
+
+Атрибут не зря назван `dangerously`. Он вставляет строку как сырой HTML без всякого экранирования:
+
+```jsx
+function Comment({ body }) {
+    // ❌ Опасно! Если body содержит <script>, он выполнится
+    return <div dangerouslySetInnerHTML={{ __html: body }} />;
+}
+```
+
+Если тебе нужно рендерить HTML от пользователя (например, поддержка форматирования комментариев), используй библиотеку санитизации **DOMPurify**:
+
+```jsx
+import DOMPurify from 'dompurify';
+
+function Comment({ body }) {
+    // ✅ Безопасно: DOMPurify удалит все скрипты и опасные атрибуты
+    const cleanHTML = DOMPurify.sanitize(body, {
+        ALLOWED_TAGS: ['b', 'i', 'a', 'p', 'br', 'ul', 'li'],
+        ALLOWED_ATTR: ['href'],
+    });
+    return <div dangerouslySetInnerHTML={{ __html: cleanHTML }} />;
+}
+```
+
+**Angular: DomSanitizer и байпасы**
+
+Angular по умолчанию тоже экранирует строки при интерполяции `{{ value }}`. Но при использовании `[innerHTML]` Angular применяет встроенный санитайзер, который удаляет потенциально опасные теги и атрибуты. Можно обойти через `DomSanitizer.bypassSecurityTrustHtml()` — никогда не делай этого для пользовательского ввода:
+
+```typescript
+// ❌ Опасно! bypassSecurityTrustHtml отключает санитизацию
+constructor(private sanitizer: DomSanitizer) {}
+this.unsafeHtml = this.sanitizer.bypassSecurityTrustHtml(userInput);
+
+// ✅ Безопасно: Angular сам санитизирует
+this.safeHtml = userInput;
+```
+
+**Почему санитизация на фронтенде не заменяет серверную**
+
+Санитизация на фронтенде защищает пользователя от XSS при просмотре контента. Но она не защищает от атак, которые не проходят через React-рендеринг: например, если API используется мобильным приложением или другим сервисом. Всегда санитизируй и на бэкенде тоже. `bluemonday` для Go — аналог DOMPurify:
+
+```go
+import "github.com/microcosm-cc/bluemonday"
+
+func sanitizeHTML(input string) string {
+    policy := bluemonday.UGCPolicy()
+    return policy.Sanitize(input)
+}
+```
+
+---
+
 ### 📝 Что мы узнали?
 - XSS — это внедрение вредоносного кода (обычно JavaScript) в страницу, которую видит жертва
 - Reflected XSS — атака через один запрос, вредоносный код в query string
 - Вредоносный скрипт выполняется в контексте легитимного домена и имеет доступ к cookies, localStorage, DOM
 - `html/template` в Go автоматически делает контекстное экранирование — это главный рубеж защиты
 - `text/template` не экранирует ничего и категорически не подходит для HTML
+- **Фронтенд:** JSX безопасен по умолчанию, `dangerouslySetInnerHTML` — нет. DOMPurify для санитизации
 
 ### 💥 Типичные ошибки
 - **Ошибка:** Использовать `text/template` для HTML
@@ -185,6 +255,7 @@ data := struct {
 - **Главная защита:** контекстное экранирование через `html/template`
 - **Go:** всегда `html/template` для HTML, никогда `text/template`
 - **HttpOnly cookies:** предотвращают кражу сессии через `document.cookie`, но не защищают от других действий через XSS
+- **React:** JSX безопасен, `dangerouslySetInnerHTML` — нет, DOMPurify для санитизации
 
 ---
 
@@ -281,15 +352,46 @@ var commentTemplate = template.Must(template.New("comments").Parse(`
 
 ---
 
+### 🔧 DevOps: сканирование логов и обнаружение Stored XSS на продакшене
+
+Stored XSS сложно обнаружить, потому что вредоносный код сидит в БД и не виден в URL. Но есть несколько подходов.
+
+**WAF не видит Stored XSS при сохранении**
+
+Когда хакер отправляет POST-запрос с вредоносным комментарием, WAF может отфильтровать payload на этапе ввода. Это ненадёжно, потому что: (1) обход WAF через кодировки, (2) вредоносный код может попасть в БД через другие каналы (импорт данных, миграции, API без WAF).
+
+**Мониторинг через CSP report-uri**
+
+Лучший способ обнаружения Stored XSS на продакшене — мониторинг отчётов CSP. Каждый раз, когда браузер пользователя блокирует инлайн-скрипт по CSP, он может отправить JSON-отчёт на указанный эндпоинт. Если у тебя включён `Content-Security-Policy-Report-Only` с `script-src 'self'` и `report-uri /api/csp-report`, ты получишь уведомление о каждой попытке выполнения инлайн-скрипта — то есть о каждом срабатывании Stored XSS у пользователей.
+
+**Сканирование БД на наличие скриптов**
+
+Можно периодически сканировать содержимое БД на наличие подстрок вроде `<script`, `onerror=`, `onload=`, `javascript:`. Это не защита, а инструмент аудита. Пример запроса для PostgreSQL:
+
+```sql
+SELECT id, body
+FROM comments
+WHERE body ILIKE '%<script%'
+   OR body ILIKE '%onerror=%'
+   OR body ILIKE '%onload=%'
+   OR body ILIKE '%javascript:%';
+```
+
+На больших объёмах такой запрос может быть тяжёлым — лучше использовать полнотекстовый поиск или Materialized View с триггером на вставку. Результаты должны отправляться в SIEM (ELK, Splunk) и триггерить алерт.
+
+---
+
 ### 📝 Что мы узнали?
 - Stored XSS сохраняется на сервере и атакует всех посетителей страницы
 - Опаснее Reflected XSS: масштаб, отсутствие взаимодействия, труднее обнаружить
 - Защита: экранирование при выводе, хранение данных в исходном виде
+- **DevOps:** обнаружение через мониторинг CSP-отчётов и периодическое сканирование БД
 
 ### 🔁 Для быстрого повторения
 - **Stored XSS:** вредоносный код в БД, показывается всем посетителям
 - **Защита:** `html/template` при выводе, не при вводе
 - **Данные храним сырыми,** экранируем в момент отображения
+- **Обнаружение:** CSP report-uri, сканирование БД на `<script>`, `onerror`
 
 ---
 
@@ -378,11 +480,74 @@ CSP не защищает от XSS напрямую, но ограничивае
 
 ---
 
+### 🔧 DevOps: WAF не видит DOM-based XSS — что делать
+
+DOM-based XSS не проходит через сервер, поэтому WAF (ModSecurity, AWS WAF, Cloudflare) **бесполезен** для её обнаружения. Единственные рубежи защиты: код фронтенда и CSP.
+
+**Практические шаги для DevOps:**
+
+1. Убедиться, что CSP включён и настроен на блокировку (`Content-Security-Policy`, не только `-Report-Only`)
+2. Настроить мониторинг CSP-отчётов (`report-uri`) — каждый заблокированный инлайн-скрипт потенциально был DOM-based XSS или Stored XSS
+3. Настроить линтинг на уровне CI/CD: ESLint с правилом `no-unsafe-innerhtml` для предотвращения использования `innerHTML` в кодовой базе
+4. Периодически сканировать фронтенд-код на наличие опасных паттернов (`innerHTML`, `document.write`, `eval`) через SAST-инструменты (Semgrep, SonarQube)
+
+---
+
+### 🖥️ Фронтенд: опасные паттерны в React и Angular
+
+**React: `dangerouslySetInnerHTML`**
+
+```jsx
+// ❌ Опасно
+<div dangerouslySetInnerHTML={{ __html: userInput }} />
+
+// ✅ Безопасно — если без HTML нельзя
+import DOMPurify from 'dompurify';
+<div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(userInput) }} />
+```
+
+**React: подмена URL через `href`**
+
+```jsx
+// ❌ Опасно: если userInput = "javascript:alert(1)"
+<a href={userInput}>Click me</a>
+
+// ✅ Безопасно: проверять протокол
+const safeURL = userInput.startsWith('http://') || userInput.startsWith('https://')
+    ? userInput
+    : '#';
+<a href={safeURL}>Click me</a>
+```
+
+**Angular: `bypassSecurityTrust...`**
+
+```typescript
+// ❌ Опасно
+this.sanitizer.bypassSecurityTrustHtml(userInput);
+this.sanitizer.bypassSecurityTrustUrl(userInput);
+this.sanitizer.bypassSecurityTrustScript(userInput);
+
+// ✅ Безопасно: не использовать bypass
+```
+
+**Angular: Router navigate с пользовательским вводом**
+
+```typescript
+// ❌ Опасно: если userInput = "javascript:alert(1)"
+this.router.navigate([userInput]);
+
+// ✅ Безопасно: валидировать URL перед навигацией
+```
+
+---
+
 ### 📝 Что мы узнали?
 - DOM-based XSS происходит полностью в браузере, сервер не видит атаку
 - Опасные источники: `location.search`, `location.hash`, `document.referrer`, `postMessage`
 - Опасные приёмники: `innerHTML`, `document.write`, `eval`, `setTimeout` со строкой
 - Защита: `textContent` вместо `innerHTML`, DOM API, CSP
+- **DevOps:** WAF бесполезен против DOM-based XSS, только CSP и линтинг
+- **Фронтенд:** избегать `dangerouslySetInnerHTML` без DOMPurify, проверять протоколы в URL
 
 ### 🔁 Для быстрого повторения
 - **DOM-based XSS:** уязвимость в клиентском JS, сервер не участвует
@@ -425,7 +590,32 @@ alert('XSS')  // Инлайн-скрипт? Заблокирован! CSP гов
 
 ---
 
-### 🛠️ Настройка CSP в Go
+### 🛠️ Способы доставки CSP в браузер
+
+CSP можно доставить двумя способами:
+
+1. **Через HTTP-заголовок `Content-Security-Policy`** — основной и рекомендуемый способ. Заголовок отправляется сервером вместе с HTML-страницей.
+
+2. **Через мета-тег `<meta>` в самом HTML** — запасной вариант, когда нет контроля над серверными заголовками. Работает не для всех директив: `frame-ancestors`, `report-uri` и `sandbox` нельзя задать через `<meta>`. Для них нужен именно HTTP-заголовок.
+
+```html
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'">
+```
+
+Мета-тег полезен, когда ты деплоишь статику в S3-бакет или через CDN, где нет возможности кастомизировать HTTP-заголовки. Но для полноценной защиты лучше использовать HTTP-заголовок.
+
+**Как браузер обрабатывает оба способа одновременно**
+
+Если CSP задан и через HTTP-заголовок, и через `<meta>`, браузер применяет **оба** — это не переопределение, а пересечение. Итоговая политика будет самым строгим сочетанием обоих. Например:
+
+- Заголовок: `script-src 'self' cdn.example.com`
+- Мета-тег: `script-src 'self'`
+
+Итог: скрипты можно загружать только с `'self'`. Источник `cdn.example.com` из заголовка заблокирован, потому что мета-тег его не разрешил. Это полезно помнить при отладке.
+
+---
+
+### 🛠️ Настройка CSP на бэкенде (когда Go отдаёт HTML)
 
 ```go
 func securityHeadersMiddleware(next http.Handler) http.Handler {
@@ -437,7 +627,8 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
             "font-src 'self'; " +
             "object-src 'none'; " +
             "base-uri 'self'; " +
-            "frame-ancestors 'none';"
+            "frame-ancestors 'none'; " +
+            "report-uri /api/csp-report;" // Собираем отчёты о нарушениях
         w.Header().Set("Content-Security-Policy", csp)
         next.ServeHTTP(w, r)
     })
@@ -451,19 +642,235 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 - `img-src 'self' data: https:` — картинки с моего домена, data: URL, и любые HTTPS
 - `object-src 'none'` — полностью запретить плагины (Flash, Java)
 - `frame-ancestors 'none'` — запретить встраивать сайт в iframe (защита от clickjacking)
+- `report-uri /api/csp-report` — браузер будет отправлять JSON-отчёты о нарушениях
+
+**Приём отчётов в Go:**
+
+```go
+func cspReportHandler(w http.ResponseWriter, r *http.Request) {
+    var report map[string]interface{}
+    json.NewDecoder(r.Body).Decode(&report)
+    log.Printf("CSP Violation: %+v", report)
+    w.WriteHeader(http.StatusNoContent)
+}
+```
+
+---
+
+### 🛠️ Настройка CSP через Nginx (когда статика отдаётся не из Go)
+
+Если твой React собран в статические файлы и отдаётся через Nginx, CSP добавляется на уровне веб-сервера, а не Go-бэкенда. Типичная архитектура:
+
+```
+Браузер → Nginx (статический index.html + прокси API) → Go (JSON)
+```
+
+В этой архитектуре Go вообще не видит HTML и не может добавить к нему HTTP-заголовки. CSP должен добавлять Nginx при отдаче `index.html`.
+
+**Базовая конфигурация Nginx с CSP:**
+
+```nginx
+server {
+    listen 80;
+    server_name your-app.com;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # CSP для всех HTML-страниц
+    location / {
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none';" always;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Проксирование API-запросов к Go-бэкенду
+    location /api/ {
+        proxy_pass http://go-backend:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # CSP здесь НЕ добавляем — это JSON, не HTML
+    }
+}
+```
+
+**Разбор ключевых моментов:**
+
+- `add_header ... always;` — флаг `always` критически важен. По умолчанию Nginx добавляет `add_header` только для успешных ответов (200, 201, 301, 302). Если без `always`, то при 404 или 500 заголовка не будет. С `always` заголовок добавляется всегда, даже на ошибки.
+
+- CSP добавляется **только** в `location /`, который отдаёт статику. Для `location /api/`, который проксирует запросы к Go, CSP не добавляется — там JSON. Но если случайно добавить CSP и на API, ничего страшного не случится: браузер получит JSON с CSP-заголовком и просто проигнорирует его, потому что JSON не рендерит HTML и не выполняет скрипты.
+
+- `try_files $uri $uri/ /index.html;` — стандартная конструкция для SPA. Если запрошенный файл не найден (например, `/about`), Nginx отдаёт `index.html`, и React роутер уже сам разбирает путь на клиенте.
+
+**Как Nginx обрабатывает каскад заголовков**
+
+Важный момент, который часто вызывает баги на продакшене. Директивы `add_header` в Nginx **наследуются** от внешнего блока к внутреннему, но **переопределяются**, а не дополняются. Если у тебя есть `add_header` на уровне `server` и `add_header` на уровне `location`, то сработает **только** тот, что в `location`. Заголовки из `server` будут проигнорированы для этого `location`.
+
+Пример неправильной конфигурации:
+
+```nginx
+server {
+    add_header X-Frame-Options "DENY" always;  # Этот заголовок потеряется для /api/
+
+    location / {
+        add_header Content-Security-Policy "..." always;
+        # Здесь будет ТОЛЬКО CSP, X-Frame-Options нет!
+    }
+
+    location /api/ {
+        proxy_pass http://go-backend:8080;
+        # Здесь вообще никаких add_header, X-Frame-Options тоже нет!
+    }
+}
+```
+
+Правильный подход — либо дублировать все нужные заголовки в каждом `location`, либо вынести их в отдельный файл и подключать через `include`:
+
+```nginx
+server {
+    location / {
+        include /etc/nginx/security-headers.conf;
+        add_header Content-Security-Policy "..." always;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        include /etc/nginx/security-headers.conf;
+        proxy_pass http://go-backend:8080;
+    }
+}
+```
+
+Где `security-headers.conf`:
+
+```nginx
+add_header X-Frame-Options "DENY" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "geolocation=(), microphone=()" always;
+```
+
+---
+
+### 🛠️ Content-Security-Policy-Report-Only — тестирование без блокировки
+
+Прежде чем включать строгий CSP на продакшене, используй заголовок `Content-Security-Policy-Report-Only`. Он заставляет браузер проверять политику и отправлять отчёты о нарушениях на указанный эндпоинт, но **не блокировать** запрещённый контент.
+
+Это критически важно при внедрении CSP на существующий проект: ты можешь увидеть все потенциальные блокировки, починить их в коде и только потом переключиться на enforcing-режим (обычный `Content-Security-Policy`).
+
+**Настройка в Nginx для report-only:**
+
+```nginx
+location / {
+    add_header Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' https://www.googletagmanager.com; report-uri /api/csp-report;" always;
+    try_files $uri $uri/ /index.html;
+}
+```
+
+После того как все нарушения починены (в логах перестали появляться новые записи), меняешь заголовок на `Content-Security-Policy` и убираешь `-Report-Only`.
+
+---
+
+### 🖥️ Как фронтендеру подготовить приложение к CSP
+
+Когда ты вводишь строгий CSP с `script-src 'self'` (без `'unsafe-inline'` и `'unsafe-eval'`), многие привычные паттерны ломаются. Вот что нужно проверить в своём React- или Angular-приложении.
+
+**1. Инлайн-скрипты и инлайн-стили**
+
+Никаких `<script>alert(1)</script>` прямо в HTML. Никаких `onclick="..."`, `onerror="..."` прямо в разметке. В React это обычно не проблема: JSX-обработчики вроде `onClick={handleClick}` не являются инлайн-скриптами с точки зрения CSP — они навешиваются через `addEventListener` из JavaScript-бандла.
+
+Инлайн-стили через атрибут `style="color: red"` требуют `'unsafe-inline'` в `style-src`. Если хочешь от него отказаться, придётся переписать все инлайн-стили на CSS-классы. Альтернатива — использовать **nonce** (криптографическая метка) для разрешённых инлайн-стилей. Сервер генерирует уникальный nonce для каждого ответа, вставляет его в CSP-заголовок и в разрешённый тег `<style nonce="...">`. Но для SPA, где HTML статичен, это сложно — проще отказаться от инлайн-стилей.
+
+**2. Динамическая загрузка скриптов и eval**
+
+`eval()`, `new Function()`, `setTimeout(string, delay)` — всё это требует `'unsafe-eval'` в CSP. Большинство современных фреймворков не используют `eval` в продакшен-режиме. React без `eval` работает. Angular работает без `eval` после AOT-компиляции. Но **Webpack Dev Server** в режиме разработки использует `eval-source-map` — это ломается при строгом CSP.
+
+Решение для Webpack: в `webpack.config.js` для development-сборки используй `devtool: 'cheap-module-source-map'` вместо `eval-source-map`. Это генерирует source maps без `eval`, медленнее, но совместимо с CSP:
+
+```javascript
+// webpack.config.js
+module.exports = {
+    mode: 'development',
+    devtool: 'cheap-module-source-map', // вместо 'eval-source-map'
+};
+```
+
+Для Vite настройка попроще — он по умолчанию не использует `eval` в продакшене, а для разработки можно использовать плагин `@vitejs/plugin-basic-ssl` для HTTPS или настроить `server.headers`:
+
+```javascript
+// vite.config.js
+export default {
+    server: {
+        headers: {
+            'Content-Security-Policy': "script-src 'self' 'unsafe-inline'",
+        },
+    },
+};
+```
+
+**3. Сторонние скрипты и ресурсы**
+
+Google Analytics, Google Tag Manager, Intercom, Stripe, Hotjar, рекламные сети, CDN для шрифтов — всё это должно быть явно перечислено в CSP. Для каждого стороннего сервиса нужно найти документацию по CSP и добавить соответствующие источники.
+
+Пример для Google Analytics (gtag.js):
+
+```
+script-src 'self' https://www.googletagmanager.com;
+connect-src 'self' https://www.google-analytics.com;
+img-src 'self' https://www.google-analytics.com;
+```
+
+Пример для Stripe.js:
+
+```
+script-src 'self' https://js.stripe.com;
+frame-src 'self' https://js.stripe.com;
+connect-src 'self' https://api.stripe.com;
+```
+
+Никогда не добавляй `https:` в `script-src` как универсальное решение — это разрешит скрипты с ЛЮБЫХ HTTPS-доменов, включая домен хакера.
+
+**4. Загрузка WebSocket и EventSource**
+
+Если приложение использует WebSocket (например, для real-time-уведомлений), нужна директива `connect-src`. WebSocket-соединения проверяются по тому же правилу, что и fetch/XHR:
+
+```
+connect-src 'self' wss://your-app.com;
+```
+
+**5. Работа с CSS-in-JS библиотеками**
+
+styled-components, Emotion, CSS Modules — все они работают по-разному с CSP. styled-components по умолчанию вставляет стили через инлайн-теги `<style>`, что требует `'unsafe-inline'` в `style-src`. Если хочешь от него отказаться, styled-components поддерживает плагин `styled-components/nonce`, который добавляет `nonce` к сгенерированным тегам `<style>`. Но это требует SSR, который генерирует уникальный nonce для каждого запроса. В чистом SPA без SSR это сложно реализовать.
+
+CSS Modules работают безопасно — стили компилируются в отдельные CSS-файлы и загружаются как внешние ресурсы, а не инлайн. Это работает с `style-src 'self'` без `'unsafe-inline'`.
 
 ---
 
 ### 📝 Что мы узнали?
-- CSP — это HTTP-заголовок, который ограничивает источники скриптов, стилей и других ресурсов
-- Работает как вторая линия обороны: если XSS прошёл, CSP может предотвратить выполнение скрипта
-- `script-src 'self'` блокирует инлайн-скрипты и скрипты с чужих доменов
-- CSP не заменяет экранирование, а дополняет его
+- CSP — это HTTP-заголовок (или мета-тег), который ограничивает источники скриптов, стилей, шрифтов, картинок, connect-запросов
+- В архитектуре с Nginx для статики CSP добавляется на уровне Nginx, не в Go
+- `add_header` в Nginx требует `always` и аккуратной работы с наследованием между `server` и `location`
+- `Content-Security-Policy-Report-Only` позволяет тестировать политику без риска сломать продакшен
+- Для совместимости с CSP на фронтенде: отказаться от `eval-source-map` в Webpack, проверить сторонние скрипты, быть осторожным с CSS-in-JS и инлайн-стилями
+- `connect-src` контролирует не только fetch/XHR, но и WebSocket, EventSource, Beacon API
+- CSP не заменяет экранирование, а дополняет его как последний рубеж обороны
+
+### 💥 Типичные ошибки
+- **Ошибка:** Забыть флаг `always` в Nginx `add_header`
+    - **Правда:** Без `always` CSP не будет работать на 404 и 500 ошибках. Часто именно через 404 страницы происходят атаки (например, кастомные 404 с отражением URL).
+- **Ошибка:** Использовать `default-src https:` как "безопасный" дефолт
+    - **Правда:** `https:` разрешает ЛЮБОЙ HTTPS-домен. Хакер может арендовать хостинг с HTTPS и загружать вредоносные скрипты оттуда. Всегда перечисляй конкретные домены.
+- **Ошибка:** Добавить `'unsafe-inline'` в `script-src` и считать, что CSP настроен
+    - **Правда:** С `'unsafe-inline'` CSP теряет большую часть своей защитной функции. Инлайн-скрипты — основной вектор XSS. Если без них никак, используй nonce или хеши.
+- **Ошибка:** Думать, что мета-тег `<meta>` полностью заменяет HTTP-заголовок
+    - **Правда:** `frame-ancestors`, `report-uri`, `sandbox` не работают через `<meta>`. Для них нужен HTTP-заголовок. Мета-тег — компромисс, когда нет доступа к серверу.
 
 ### 🔁 Для быстрого повторения
-- **CSP:** HTTP-заголовок `Content-Security-Policy`
-- **Ключевая директива:** `script-src 'self'` — блокирует инлайн-скрипты
-- **Defence in depth:** экранирование + CSP + HttpOnly cookies
+- **CSP:** HTTP-заголовок `Content-Security-Policy` или мета-тег
+- **Основные директивы:** `script-src`, `style-src`, `img-src`, `connect-src`, `frame-src`, `object-src`
+- **Nginx:** `add_header ... always;` в `location /`, не в `location /api/`
+- **Report-Only:** тестирование без блокировки через `Content-Security-Policy-Report-Only`
+- **Фронтенд:** Webpack без `eval`, сторонние домены в белом списке, осторожно с CSS-in-JS
+- **Defence in depth:** экранирование + HttpOnly cookies + CSP
 
 ---
 
@@ -479,6 +886,8 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 8.  Что произойдёт, если использовать `text/template` вместо `html/template` для генерации HTML в Go? Покажи на примере.
 9.  Хакер нашёл XSS в админке, которая доступна только администраторам. Это Self-XSS. Можно ли его превратить в атаку на обычных пользователей?
 10. Ты настроил CSP с `script-src 'self'`. Через месяц тебе нужно добавить скрипт аналитики с `google-analytics.com`. Как правильно обновить CSP, не открывая дыру для других доменов?
+11. В твоём React-приложении используется `dangerouslySetInnerHTML` для рендеринга пользовательских комментариев. Как защитить пользователей от XSS, не убирая HTML-форматирование?
+12. Почему `add_header` в Nginx требует флага `always`? Что произойдёт без него на странице 404?
 
 ---
 
@@ -515,6 +924,19 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 9.  Self-XSS — это XSS, который видит только сам пользователь (например, в поле «имя профиля», которое показывается только ему). Но если администратор может просматривать профили пользователей в админке, Self-XSS становится Stored XSS для администратора. Хакер создаёт аккаунт с XSS в имени, администратор заходит в админку посмотреть на нового пользователя — и выполняется вредоносный скрипт с привилегиями администратора.
 
 10. Обновить CSP: `script-src 'self' https://www.google-analytics.com;`. Это разрешит скрипты с моего домена и конкретно с `google-analytics.com`, но не с других доменов. Нельзя использовать `script-src 'self' https:` — это разрешит ЛЮБЫЕ скрипты по HTTPS с любых доменов, включая домен хакера.
+
+11. Использовать DOMPurify для санитизации HTML перед вставкой:
+    ```jsx
+    import DOMPurify from 'dompurify';
+    const cleanHTML = DOMPurify.sanitize(userInput, {
+        ALLOWED_TAGS: ['b', 'i', 'a', 'p', 'br'],
+        ALLOWED_ATTR: ['href'],
+    });
+    <div dangerouslySetInnerHTML={{ __html: cleanHTML }} />
+    ```
+    DOMPurify удалит все `<script>`, обработчики событий (`onerror`, `onload`) и `javascript:` URL, оставив только безопасное форматирование.
+
+12. Без `always` Nginx добавляет `add_header` только для успешных HTTP-ответов (2xx, 3xx). На 404 или 500 заголовок CSP не отправится. Страницы ошибок часто содержат отражённый пользовательский ввод (например, «Страница /search?q=... не найдена») — это классический вектор для Reflected XSS. CSP должен защищать и страницы ошибок, поэтому `always` обязателен.
 
 ---
 

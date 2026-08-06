@@ -198,6 +198,29 @@ func main() {
 
 4. **Очистка старых IP:** В продакшене нужно добавить goroutine, которая периодически чистит `limiters` от IP, которые давно не делали запросов. Иначе map будет расти бесконечно и утечёт память.
 
+**Важное дополнение про `X-Forwarded-For`**
+
+Если твой Go-сервис стоит за Nginx или другим reverse proxy, `r.RemoteAddr` будет показывать IP самого proxy (например, `127.0.0.1`), а не реальный IP клиента. Все запросы будут лимитироваться как один клиент. Нужно использовать заголовок `X-Forwarded-For` или `X-Real-IP`:
+
+```go
+func getClientIP(r *http.Request) string {
+    // Сначала пробуем X-Real-IP (проще, содержит один IP)
+    if ip := r.Header.Get("X-Real-IP"); ip != "" {
+        return ip
+    }
+    // Затем X-Forwarded-For (может содержать цепочку proxy)
+    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+        // Берём первый IP в цепочке (клиент)
+        parts := strings.Split(xff, ",")
+        return strings.TrimSpace(parts[0])
+    }
+    // Fallback на RemoteAddr
+    return r.RemoteAddr
+}
+```
+
+И используй `getClientIP(r)` вместо `r.RemoteAddr` в middleware. Не забудь, что `X-Forwarded-For` может быть подделан клиентом, если Nginx его не перезаписывает. В Nginx нужно убедиться, что директива `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` настроена правильно.
+
 ---
 
 #### Рубеж 2: Оптимизация тяжёлых эндпоинтов
@@ -229,11 +252,234 @@ location /api/ {
 
 ---
 
+### 🔧 DevOps: автоматическая блокировка через fail2ban
+
+Rate limiting через Nginx отбрасывает лишние запросы от IP, но сами соединения всё ещё доходят до сервера. При массивной атаке даже 429-е ответы создают нагрузку. `fail2ban` идёт дальше — он анализирует логи Nginx и на лету добавляет правила в iptables, полностью блокируя IP на сетевом уровне.
+
+*(fail2ban — система предотвращения вторжений, которая анализирует лог-файлы и при обнаружении подозрительной активности (например, множество 429 ошибок от одного IP) автоматически добавляет блокирующие правила в файервол. Работает как временный бан: IP блокируется на заданный интервал (bantime), после чего разблокируется.)*
+
+**Настройка fail2ban для защиты от HTTP-флуда:**
+
+Создаём фильтр `/etc/fail2ban/filter.d/nginx-ratelimit.conf`:
+
+```ini
+[Definition]
+failregex = ^<HOST> -.* "(GET|POST|HEAD).*" 429 .*$
+            ^<HOST> -.* "(GET|POST|HEAD).*" (502|503|504) .*$
+ignoreregex =
+```
+
+Этот фильтр ищет строки с IP, которые получили 429 (слишком много запросов) или 502/503/504 (сервер лёг). Обычно за 502/503 стоит не сам клиент, а балансировщик или upstream, так что второе правило опционально и зависит от архитектуры.
+
+Создаём правило `/etc/fail2ban/jail.d/nginx-ratelimit.conf`:
+
+```ini
+[nginx-ratelimit]
+enabled  = true
+filter   = nginx-ratelimit
+logpath  = /var/log/nginx/access.log
+maxretry = 20
+findtime = 10
+bantime  = 3600
+```
+
+Разбор параметров:
+- `maxretry = 20` — после 20 совпадений за `findtime` секунд IP блокируется
+- `findtime = 10` — окно в 10 секунд, за которое набираются совпадения
+- `bantime = 3600` — блокировка на 1 час
+
+Важно настроить параметры так, чтобы не заблокировать легитимных пользователей. Если твой SPA делает много API-запросов при загрузке, burst в Nginx должен покрывать этот легитимный трафик, а fail2ban — срабатывать только при явном превышении. Мониторинг логов fail2ban (`/var/log/fail2ban.log`) поможет откалибровать параметры.
+
+После настройки перезапускаем fail2ban:
+
+```bash
+sudo systemctl restart fail2ban
+sudo fail2ban-client status nginx-ratelimit  # Проверить статус
+```
+
+---
+
+### 🖥️ Фронтенд: как помочь серверу при DDoS
+
+Когда сервер под DDoS, он отвечает 429 (Too Many Requests) или 503 (Service Unavailable). Твой фронтенд на React или Angular должен корректно обрабатывать эти ошибки, иначе пользователь увидит белый экран или бесконечный спиннер.
+
+**Retry-After и экспоненциальный backoff**
+
+Хороший бэкенд при 429 возвращает заголовок `Retry-After`, указывающий, через сколько секунд можно повторить запрос. Фронтенд должен уважать этот заголовок и не пытаться повторить запрос мгновенно. Если бэкенд не возвращает `Retry-After`, фронтенд сам реализует экспоненциальный backoff — с каждой повторной попыткой задержка увеличивается вдвое.
+
+Пример на React с axios:
+
+```javascript
+// axios interceptor для обработки 429
+axios.interceptors.response.use(
+    response => response,
+    async error => {
+        const { config, response } = error;
+
+        // Если не 429 или это уже повторная попытка — пробрасываем ошибку дальше
+        if (response?.status !== 429 || config._retryCount >= 3) {
+            return Promise.reject(error);
+        }
+
+        config._retryCount = config._retryCount || 0;
+        config._retryCount++;
+
+        // Используем Retry-After из заголовка или экспоненциальный backoff
+        const retryAfter = response.headers['retry-after'];
+        const delay = retryAfter
+            ? parseInt(retryAfter) * 1000
+            : Math.min(1000 * Math.pow(2, config._retryCount), 30000); // max 30 sec
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return axios(config);
+    }
+);
+```
+
+Пример на Angular с HttpClient и RxJS:
+
+```typescript
+import { Injectable } from '@angular/core';
+import { HttpInterceptor, HttpRequest, HttpHandler, HttpEvent, HttpStatusCode } from '@angular/common/http';
+import { Observable, retryWhen, delay, take, mergeMap, throwError } from 'rxjs';
+
+@Injectable()
+export class RetryInterceptor implements HttpInterceptor {
+    intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+        return next.handle(req).pipe(
+            retryWhen(errors =>
+                errors.pipe(
+                    mergeMap((error, index) => {
+                        if (error.status !== HttpStatusCode.TooManyRequests || index >= 3) {
+                            return throwError(() => error);
+                        }
+                        const retryAfter = error.headers.get('Retry-After');
+                        const delayMs = retryAfter
+                            ? parseInt(retryAfter) * 1000
+                            : Math.min(1000 * Math.pow(2, index), 30000);
+                        return new Observable(observer => {
+                            setTimeout(() => observer.next(), delayMs);
+                        });
+                    })
+                )
+            )
+        );
+    }
+}
+```
+
+**Предотвращение каскадных отказов (Circuit Breaker)**
+
+Когда пользователь открывает страницу, которая делает 10 API-запросов, и сервер под DDoS, каждый запрос будет повторяться с backoff. Это создаёт дополнительную нагрузку на и без того страдающий сервер. Паттерн Circuit Breaker решает эту проблему: если определённый процент запросов падает с ошибкой, цепь размыкается, и все последующие запросы немедленно возвращают ошибку без реальной отправки на сервер. Через заданный интервал цепь переходит в состояние half-open — один пробный запрос проверяет, восстановился ли сервер.
+
+Для React можно использовать библиотеку `opossum` или реализовать простой circuit breaker вручную:
+
+```javascript
+class CircuitBreaker {
+    constructor({ failureThreshold = 5, resetTimeout = 30000 }) {
+        this.failureCount = 0;
+        this.failureThreshold = failureThreshold;
+        this.resetTimeout = resetTimeout;
+        this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+        this.nextAttempt = Date.now();
+    }
+
+    async call(fn) {
+        if (this.state === 'OPEN') {
+            if (Date.now() < this.nextAttempt) {
+                throw new Error('Circuit breaker is OPEN');
+            }
+            this.state = 'HALF_OPEN';
+        }
+
+        try {
+            const result = await fn();
+            this.onSuccess();
+            return result;
+        } catch (error) {
+            this.onFailure();
+            throw error;
+        }
+    }
+
+    onSuccess() {
+        this.failureCount = 0;
+        this.state = 'CLOSED';
+    }
+
+    onFailure() {
+        this.failureCount++;
+        if (this.failureCount >= this.failureThreshold) {
+            this.state = 'OPEN';
+            this.nextAttempt = Date.now() + this.resetTimeout;
+        }
+    }
+}
+
+// Использование
+const breaker = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 });
+const fetchUsers = () => breaker.call(() => fetch('/api/users'));
+```
+
+**Debounce для пользовательского ввода**
+
+Если в твоём приложении есть поле поиска с автокомплитом (как в примере с `/api/search?q=...`), каждый ввод символа отправляет запрос на сервер. Без debounce быстро печатающий пользователь может отправить 10 запросов в секунду — что выглядит как микро-DoS. Решение — debounce: запрос отправляется только после того, как пользователь перестал печатать на 300-500 мс.
+
+```javascript
+// React: хук useDebounce
+function useDebounce(value, delay = 300) {
+    const [debouncedValue, setDebouncedValue] = useState(value);
+
+    useEffect(() => {
+        const timer = setTimeout(() => setDebouncedValue(value), delay);
+        return () => clearTimeout(timer);
+    }, [value, delay]);
+
+    return debouncedValue;
+}
+
+function SearchComponent() {
+    const [query, setQuery] = useState('');
+    const debouncedQuery = useDebounce(query, 300);
+
+    useEffect(() => {
+        if (debouncedQuery) {
+            fetch(`/api/search?q=${encodeURIComponent(debouncedQuery)}`);
+        }
+    }, [debouncedQuery]);
+    // ...
+}
+```
+
+В Angular аналогичное поведение достигается через `debounceTime` в RxJS:
+
+```typescript
+this.searchControl.valueChanges.pipe(
+    debounceTime(300),
+    distinctUntilChanged(),
+    switchMap(query => this.http.get(`/api/search?q=${encodeURIComponent(query)}`))
+).subscribe();
+```
+
+**Graceful degradation: что показывать пользователю при DDoS**
+
+Когда сервер под атакой, API может быть недоступен. Фронтенд должен не падать с белым экраном, а показывать закешированные данные или понятное сообщение. Стратегии:
+
+1. **Stale-while-revalidate:** Показываем данные из кеша (localStorage, IndexedDB, Memory Cache), а в фоне пытаемся обновить. Если API не отвечает — пользователь хотя бы видит старые данные, а не ошибку.
+
+2. **Статические заглушки:** Критически важные данные (курсы валют, расписание) можно закешировать на CDN и показывать с пометкой «Данные могут быть неактуальны». Пользователь видит информацию, а не сообщение об ошибке, и это снижает нагрузку на поддержку.
+
+3. **Индикатор состояния:** Показывать баннер «Сервис временно перегружен, данные могут загружаться медленнее обычного». Это информирует пользователя, что проблема на стороне сервера, а не в его интернете.
+
+---
+
 ### 📝 Что мы узнали?
 - HTTP-флуд атакует **Доступность**, используя легитимные запросы к тяжёлым эндпоинтам
 - Атака истощает CPU, память и соединения с БД
 - Главный щит — **Rate Limiting** с алгоритмом Token Bucket
 - Три рубежа защиты: код (middleware), оптимизация эндпоинтов, внешний CDN/WAF
+- **DevOps:** fail2ban автоматически блокирует IP атакующих на уровне iptables
+- **Фронтенд:** Retry-After, экспоненциальный backoff, Circuit Breaker, debounce, graceful degradation
 
 ### 💥 Типичные ошибки
 - **Ошибка:** «Я защитился Cloudflare, мне не нужен rate limiting в коде»
@@ -242,13 +488,19 @@ location /api/ {
     - **Правда:** `DefaultClient` не имеет таймаута. Если сервер зависнет, воркеры зависнут навсегда. Всегда задавай `Timeout`.
 - **Ошибка:** Забыть про `resp.Body.Close()` в flood-клиенте
     - **Правда:** Без закрытия тела соединение не вернётся в пул. Твой собственный флудер начнёт умирать от нехватки соединений.
+- **Ошибка:** Использовать `r.RemoteAddr` для rate limiting за reverse proxy
+    - **Правда:** Все запросы будут иметь IP proxy. Нужно брать IP из `X-Forwarded-For` или `X-Real-IP`.
+- **Ошибка:** Бесконечно повторять запросы при 429 ошибке
+    - **Правда:** Без backoff фронтенд создаёт дополнительную нагрузку на и без того перегруженный сервер. Уважай `Retry-After`, ограничивай количество попыток, используй Circuit Breaker.
 
 ### 🔁 Для быстрого повторения
 - **HTTP Flood:** L7-атака, истощает CPU/память/соединения через легитимные запросы
 - **Token Bucket:** алгоритм rate limiting'а — скорость пополнения + burst
 - **Go-реализация:** `golang.org/x/time/rate`, middleware с `PerIPRateLimiter`
 - **429 Too Many Requests:** стандартный HTTP-статус при превышении лимита
-- **Defence in depth:** защита на уровне кода + CDN/WAF + оптимизация эндпоинтов
+- **Defence in depth:** защита на уровне кода + CDN/WAF + fail2ban + оптимизация эндпоинтов
+- **fail2ban:** автоматическая блокировка IP через iptables при детекте флуда в логах Nginx
+- **Фронтенд:** Retry-After, экспоненциальный backoff, Circuit Breaker, debounce, stale-while-revalidate
 
 ---
 
@@ -358,25 +610,115 @@ echo "net.ipv4.tcp_syncookies = 1" | sudo tee -a /etc/sysctl.conf
 
 ---
 
+### 🔧 DevOps: iptables для ограничения SYN-пакетов
+
+SYN Cookies защищают backlog, но не спасают от полного насыщения канала. Дополнительный уровень — ограничение частоты SYN-пакетов через iptables на самом сервере:
+
+```bash
+# Ограничить SYN-пакеты на порт 80: не больше 10 в секунду, burst до 20
+sudo iptables -A INPUT -p tcp --dport 80 --syn -m limit --limit 10/second --limit-burst 20 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 80 --syn -j DROP
+
+# Ограничить SYN-пакеты на порт 443 (HTTPS)
+sudo iptables -A INPUT -p tcp --dport 443 --syn -m limit --limit 10/second --limit-burst 20 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 443 --syn -j DROP
+```
+
+Разбор:
+- `-p tcp --dport 80 --syn` — только TCP SYN-пакеты на порт 80
+- `-m limit --limit 10/second --limit-burst 20` — модуль limit: не более 10 пакетов в секунду, с возможностью всплеска до 20
+- `-j ACCEPT` для проходящих по лимиту, `-j DROP` для остальных
+
+**Важно:** Это правило идёт **после** правила для уже установленных соединений (`-m state --state ESTABLISHED,RELATED -j ACCEPT`). Иначе легитимные ACK-пакеты тоже будут резаться. Полный порядок правил должен быть таким:
+
+```bash
+# 1. Разрешить уже установленные соединения (включая ACK на наши SYN-ACK)
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+# 2. Разрешить loopback
+iptables -A INPUT -i lo -j ACCEPT
+# 3. Ограничить новые SYN
+iptables -A INPUT -p tcp --dport 80 --syn -m limit --limit 10/sec --limit-burst 20 -j ACCEPT
+iptables -A INPUT -p tcp --dport 80 --syn -j DROP
+```
+
+**Сохранение правил iptables после перезагрузки:**
+
+На Ubuntu/Debian:
+```bash
+sudo apt install iptables-persistent
+sudo netfilter-persistent save
+```
+
+На CentOS/RHEL:
+```bash
+sudo service iptables save
+```
+
+---
+
+### 🔧 DevOps: Docker ulimit и защита от исчерпания ресурсов
+
+Если твой Go-сервис работает в Docker, SYN-флуд может исчерпать не только backlog ядра хоста, но и ресурсы конкретного контейнера. Docker по умолчанию наследует `ulimit` от хоста, но их можно настроить явно.
+
+При HTTP-флуде контейнер может исчерпать лимит открытых файлов (каждое соединение — это файловый дескриптор). В `docker-compose.yml` можно задать лимиты:
+
+```yaml
+services:
+  go-backend:
+    image: myapp:latest
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+```
+
+Разбор:
+- `nofile` — лимит на количество открытых файловых дескрипторов (включая сетевые соединения). 65536 — стандартное значение для высоконагруженных сервисов
+- `cpus: '2'` — контейнер не может использовать больше 2 ядер CPU, даже если хост мощнее. Предотвращает ситуацию, когда один контейнер забирает весь CPU и кладёт соседние сервисы
+- `memory: 512M` — жёсткий лимит памяти. При превышении Docker убьёт контейнер (OOM kill) и перезапустит, если настроен `restart: always`
+
+Для Kubernetes аналогичные лимиты задаются в `resources`:
+
+```yaml
+resources:
+  limits:
+    cpu: "2"
+    memory: "512Mi"
+  requests:
+    cpu: "500m"
+    memory: "256Mi"
+```
+
+`limits` — жёсткий потолок, `requests` — гарантированный минимум при планировании подов.
+
+---
+
 ### 📝 Что мы узнали?
 - SYN-флуд атакует на транспортном уровне (L4), эксплуатируя TCP handshake
 - Сервер выделяет память под полуоткрытые соединения в очереди backlog
 - SYN Cookies решают проблему в корне — не хранят состояние до завершения рукопожатия
 - Защита от SYN-флуда — на уровне ОС и сетевой инфраструктуры, не в коде приложения
+- **DevOps:** iptables для ограничения частоты SYN-пакетов, Docker ulimit для защиты от исчерпания ресурсов
 
 ### 💥 Типичные ошибки
 - **Ошибка:** Пытаться отфильтровать SYN-флуд в коде Go
     - **Правда:** Твой код даже не получает эти соединения. Они умирают на уровне ядра. Rate limiting в коде бесполезен против SYN-флуда.
 - **Ошибка:** Думать, что SYN Cookies решают все проблемы
-    - **Правда:** SYN Cookies защищают backlog, но не спасают от полного насыщения канала. Если хакер гонит 10 Гбит/с SYN-пакетов, твой канал просто забьётся. Нужна внешняя фильтрация (ISP/Cloud).
+    - **Правда:** SYN Cookies защищают backlog, но не спасают от полного насыщения канала. Если хакер гонит 10 Гбит/с SYN-пакетов, твой канал просто забьётся. Нужна внешняя фильтрация (ISP/Cloud) и iptables на сервере.
 - **Ошибка:** Не включать SYN Cookies, потому что «они ломают некоторые TCP-опции»
     - **Правда:** Да, SYN Cookies не сохраняют TCP-опции (window scaling, SACK). Но это лучше, чем сервер вообще не отвечает. В современных ядрах (Linux 4.x+) SYN Cookies работают с TCP-опциями через timestamp-расширение.
 
 ### 🔁 Для быстрого повторения
 - **SYN Flood:** L4-атака, переполнение backlog очереди полуоткрытых соединений
 - **SYN Cookies:** криптографическое кодирование состояния в seq number, защита backlog
-- **Защита:** `sysctl tcp_syncookies=1`, ISP scrubbing, Anycast networks
+- **Защита:** `sysctl tcp_syncookies=1`, iptables limit, ISP scrubbing, Anycast networks
 - **Go-разработчик:** твой код не видит SYN-флуд, защита на уровне инфраструктуры
+- **Docker:** `ulimits.nofile` и `resources.limits` для предотвращения исчерпания ресурсов контейнера
 
 ---
 
@@ -422,17 +764,40 @@ DNS — это телефонная книга интернета. Ты спра
 
 ---
 
+### 🔧 DevOps: BCP 38 и защита на уровне сети
+
+Амплификация использует подделку source IP. Эта техника работает только потому, что провайдеры хакера не следуют **BCP 38** (Best Current Practice 38 — RFC 2827). BCP 38 предписывает провайдерам фильтровать исходящие пакеты: если пакет выходит из сети провайдера, но source IP не принадлежит этой сети — отбросить его.
+
+Ты не можешь заставить провайдера хакера следовать BCP 38. Но ты можешь:
+- Убедиться, что твой собственный провайдер или облако применяет anti-spoofing на границе сети
+- Для своих серверов настроить reverse path filtering (rp_filter) — ядро будет отбрасывать пакеты, source IP которых не маршрутизируется через интерфейс, с которого они пришли
+
+```bash
+# Включить strict reverse path filtering
+sysctl -w net.ipv4.conf.all.rp_filter=1
+sysctl -w net.ipv4.conf.default.rp_filter=1
+
+# Сохранить
+echo "net.ipv4.conf.all.rp_filter = 1" >> /etc/sysctl.conf
+echo "net.ipv4.conf.default.rp_filter = 1" >> /etc/sysctl.conf
+```
+
+Это не защитит от amplification напрямую, но предотвратит использование твоих серверов как отражателей в атаках на других.
+
+---
+
 ### 📝 Что мы узнали?
 - Amplification-атаки используют легитимные сервисы как усилители
 - DNS Amplification даёт коэффициент усиления до 70x
 - Защита — на уровне провайдера (scrubbing centres)
 - Как админ DNS — закрой открытый резолвер
+- **DevOps:** BCP 38, rp_filter для предотвращения спуфинга с твоих серверов
 
 ### 🔁 Для быстрого повторения
 - **Amplification:** маленький запрос → большой ответ → усиление трафика
 - **Reflection:** поддельный source IP → ответы идут на жертву
 - **DNS Amplification:** `ANY` запросы, DNSSEC, до 70x усиления
-- **Защита:** ISP scrubbing, закрытие открытых резолверов
+- **Защита:** ISP scrubbing, закрытие открытых резолверов, BCP 38, rp_filter
 
 ---
 
@@ -448,6 +813,9 @@ DNS — это телефонная книга интернета. Ты спра
 8.  Зачем нужен `resp.Body.Close()` в HTTP-клиенте? Что произойдёт, если его не вызвать при нагрузочном тестировании?
 9.  Твой эндпоинт `/api/report` генерирует PDF на лету и занимает 3 секунды. Как защитить его от slow-rate DDoS, не ломая функциональность для легитимных пользователей?
 10. Какие метрики ты будешь мониторить в Grafana, чтобы вовремя обнаружить DDoS-атаку? Напиши 4-5 конкретных метрик.
+11. Как фронтенд на React должен обрабатывать 429 (Too Many Requests) от сервера, чтобы не усугублять DDoS повторными запросами?
+12. Что делает fail2ban и чем его защита принципиально отличается от rate limiting через Nginx?
+13. Зачем настраивать `ulimits.nofile` для Docker-контейнера с Go-сервисом? Что произойдёт без этой настройки под HTTP-флудом?
 
 ---
 
@@ -455,13 +823,13 @@ DNS — это телефонная книга интернета. Ты спра
 
 1.  **HTTP-флуд** — L7 (Application), истощает CPU/память/соединения БД через обработку легитимных HTTP-запросов. Сервер видит эти запросы в логах. **SYN-флуд** — L4 (Transport), истощает backlog очередь TCP-соединений в ядре ОС. Сервер даже не доходит до обработки HTTP — соединение зависает в состоянии SYN_RECV.
 
-2.  **Rate limiting в коде** — это первый рубеж. Недостаточно. Нужны: (1) оптимизация тяжёлых эндпоинтов (кеш, пагинация, асинхронные задачи), (2) внешняя защита на уровне CDN/WAF (Cloudflare, AWS Shield), (3) мониторинг и алертинг (Grafana + Prometheus) для раннего обнаружения.
+2.  **Rate limiting в коде** — это первый рубеж. Недостаточно. Нужны: (1) оптимизация тяжёлых эндпоинтов (кеш, пагинация, асинхронные задачи), (2) внешняя защита на уровне CDN/WAF (Cloudflare, AWS Shield), (3) fail2ban для блокировки на уровне iptables, (4) мониторинг и алертинг (Grafana + Prometheus) для раннего обнаружения.
 
 3.  **Token Bucket:** ведро пополняется токенами с постоянной скоростью (`rate`), максимальная ёмкость ведра — `burst`. Запрос забирает один токен. Если токенов нет — запрос отклоняется. Burst важен: легитимный пользователь может открыть страницу, которая делает 5 параллельных API-запросов — burst позволяет обработать этот всплеск без ошибок.
 
 4.  **SYN Cookies:** сервер не хранит полуоткрытые соединения в памяти. Вместо этого кодирует информацию о SYN-пакете в sequence number ответного SYN-ACK (криптографический хеш). При получении ACK декодирует и проверяет подпись. **Проблема:** защищает backlog, не защищает от насыщения канала. **Цена:** теряются TCP-опции (window scaling, SACK), хотя в современных ядрах это частично решено через timestamp-расширение.
 
-5.  **SYN-флуд происходит на уровне ядра ОС**, до того как соединение передаётся приложению. Go-процесс получает уже установленное TCP-соединение через accept(). При SYN-флуде очередь переполняется до accept(), Go даже не видит этих запросов. Защита — `tcp_syncookies`, настройки ядра, внешний scrubbing.
+5.  **SYN-флуд происходит на уровне ядра ОС**, до того как соединение передаётся приложению. Go-процесс получает уже установленное TCP-соединение через accept(). При SYN-флуде очередь переполняется до accept(), Go даже не видит этих запросов. Защита — `tcp_syncookies`, iptables, настройки ядра, внешний scrubbing.
 
 6.  **Нет, реальный IP хакера не виден в логах жертвы.** Хакер подделывает source IP в DNS-запросах — они приходят с IP жертвы. DNS-серверы отправляют ответы на жертву. Жертва видит только IP DNS-резолверов. Отследить хакера можно только по логам DNS-серверов, если они сохраняются (что редко).
 
@@ -477,6 +845,12 @@ DNS — это телефонная книга интернета. Ты спра
     - `go_goroutines` — количество горутин (при HTTP-флуде растёт)
     - `node_network_receive_bytes_total` — входящий сетевой трафик (SYN-флуд)
     - `pg_stat_database_numbackends` — количество соединений с PostgreSQL
+
+11. **React при 429 должен:** (1) читать заголовок `Retry-After`, если он есть; (2) если нет — использовать экспоненциальный backoff (1с, 2с, 4с, max 30с); (3) ограничить количество повторных попыток (например, 3); (4) показывать пользователю баннер «Сервис перегружен, пробуем восстановить соединение»; (5) для некритичных запросов можно просто закешировать последний успешный ответ и показывать его.
+
+12. **fail2ban** работает на уровне iptables — он полностью блокирует IP, пакеты отбрасываются ядром ещё до того, как дойдут до Nginx. **Rate limiting через Nginx** возвращает 429, но соединение всё ещё устанавливается, Nginx тратит ресурсы на обработку и отправку ответа. При массовой атаке fail2ban эффективнее, потому что злоумышленник даже не доходит до приложения. Но fail2ban грубее — он блокирует IP целиком, а rate limiting может пропускать легитимные запросы в пределах лимита.
+
+13. **`ulimits.nofile`** ограничивает количество открытых файловых дескрипторов, включая сетевые соединения. По умолчанию в Docker лимит может быть 1024. Под HTTP-флудом каждое входящее соединение + исходящее к БД = 2 дескриптора. При 500 одновременных запросах лимит исчерпан, новые соединения не принимаются — сервер лежит, хотя CPU и память в норме. Установка `nofile: 65536` решает эту проблему. Ограничения CPU и памяти (`resources.limits`) защищают соседние контейнеры от эффекта "noisy neighbour".
 
 ---
 
