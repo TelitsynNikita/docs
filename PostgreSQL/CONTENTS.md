@@ -5,4 +5,5 @@
 [Глава 3: Индексы B-tree — как PostgreSQL находит данные за миллисекунды](chapter3.md)  
 [Глава 4: Продвинутые индексы — GIN, GiST, BRIN и что скрывается за JSONB](chapter4.md)  
 [Глава 5: MVCC — как PostgreSQL обеспечивает конкурентный доступ](chapter5.md)  
+[Глава 6: VACUUM и Autovacuum — борьба с раздуванием таблиц](chapter6.md)  
  
