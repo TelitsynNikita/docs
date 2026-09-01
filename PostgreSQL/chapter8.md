@@ -9,6 +9,8 @@
 - Что такое DDL, constraints и как модифицировать таблицы.
 - Как работать с Views и Materialized Views.
 - Как писать пагинацию: LIMIT/OFFSET, Keyset, Cursor и гибридные подходы.
+- Как защититься от SQL-инъекций через параметризацию.
+- Как выполнять массовые вставки эффективно.
 
 **После прочтения вы сможете:**
 - Выбрать правильный JOIN под задачу.
@@ -18,6 +20,8 @@
 - Спроектировать базовые таблицы с правильными constraints.
 - Написать пагинацию, которая не деградирует на больших объёмах.
 - Понимать, что происходит под капотом для каждой SQL-команды.
+- Писать безопасные параметризованные запросы в Go.
+- Выполнять batch-вставки эффективно через pgx.
 
 ---
 
@@ -33,12 +37,14 @@
 - [8.7 CTE и WITH: временные таблицы](#87-cte-и-with-временные-таблицы)
 - [8.8 Views и Materialized Views](#88-views-и-materialized-views)
 - [8.9 Пагинация: LIMIT/OFFSET, Keyset, Cursor](#89-пагинация-limitoffset-keyset-cursor)
-- [8.10 Практика Go: работа с SQL в коде](#810-практика-go-работа-с-sql-в-коде)
-- [8.11 Выводы и типичные ошибки](#811-выводы-и-типичные-ошибки)
-- [8.12 Для быстрого повторения](#812-для-быстрого-повторения)
-- [8.13 Вопросы для самопроверки](#813-вопросы-для-самопроверки)
-- [8.14 Ответы](#814-ответы)
-- [8.15 Куда идти дальше?](#815-куда-идти-дальше)
+- [8.10 Безопасность: параметризация запросов](#810-безопасность-параметризация-запросов)
+- [8.11 Batch insert: массовые вставки эффективно](#811-batch-insert-массовые-вставки-эффективно)
+- [8.12 Практика Go: работа с SQL в коде](#812-практика-go-работа-с-sql-в-коде)
+- [8.13 Выводы и типичные ошибки](#813-выводы-и-типичные-ошибки)
+- [8.14 Для быстрого повторения](#814-для-быстрого-повторения)
+- [8.15 Вопросы для самопроверки](#815-вопросы-для-самопроверки)
+- [8.16 Ответы](#816-ответы)
+- [8.17 Куда идти дальше?](#817-куда-идти-дальше)
 
 ---
 
@@ -574,6 +580,35 @@ CROSS JOIN LATERAL (
 
 ---
 
+### Бизнес через год: новый отчёт
+
+**Сценарий:**
+
+```
+Сегодня:
+  Запросы: заказы пользователя → INNER JOIN orders + users.
+
+Через год:
+  Бизнес просит: «Покажи ВСЕХ пользователей и их последний заказ,
+  даже если заказа нет».
+
+  INNER JOIN не подходит — он исключает пользователей без заказов.
+
+Решение: LEFT JOIN + LATERAL:
+
+  SELECT u.name, o.id AS last_order_id, o.created_at
+  FROM users u
+  LEFT JOIN LATERAL (
+      SELECT id, created_at 
+      FROM orders 
+      WHERE user_id = u.id 
+      ORDER BY created_at DESC 
+      LIMIT 1
+  ) o ON true;
+```
+
+---
+
 ## 8.5 Подзапросы
 
 ### Скалярный подзапрос
@@ -762,7 +797,434 @@ SELECT id, name FROM products WHERE id > 289 ORDER BY id LIMIT 10;
 
 ---
 
-## 8.10 Практика Go: работа с SQL в коде
+## 8.10 Безопасность: параметризация запросов
+
+До сих пор мы писали SQL-запросы с **захардкоженными** значениями. В реальном приложении значения приходят от пользователя — и это **опасно**.
+
+### Проблема: SQL-инъекция
+
+**SQL-инъекция** — атака, при которой злоумышленник вставляет свой SQL-код в запрос.
+
+```go
+// ❌ ОПАСНО: конкатенация строк
+func getUserByName(db *sql.DB, name string) (*User, error) {
+    query := fmt.Sprintf("SELECT id, name, email FROM users WHERE name = '%s'", name)
+    // Если name = "' OR '1'='1" →
+    // SELECT id, name, email FROM users WHERE name = '' OR '1'='1'
+    // Вернёт ВСЕХ пользователей!
+    return db.QueryRow(query).Scan(...)
+}
+
+// Ещё хуже:
+// name = "'; DROP TABLE users; --"
+// → SELECT ... WHERE name = ''; DROP TABLE users; --'
+// Таблица users УДАЛЕНА!
+```
+
+**Как это работает:**
+
+```
+Пользователь вводит в поле поиска:
+  '; DROP TABLE users; --
+
+Твой код подставляет в SQL:
+  SELECT * FROM users WHERE name = ''; DROP TABLE users; --';
+
+PostgreSQL видит ДВА запроса:
+  1. SELECT * FROM users WHERE name = '';
+  2. DROP TABLE users;
+
+Второй запрос УДАЛЯЕТ таблицу!
+```
+
+### Решение: параметризованные запросы
+
+**Параметризованный запрос** — SQL, в котором значения заменены на плейсхолдеры (`$1`, `$2`), а сами значения передаются **отдельно**.
+
+```go
+// ✅ БЕЗОПАСНО: параметризация
+func getUserByName(db *sql.DB, name string) (*User, error) {
+    query := "SELECT id, name, email FROM users WHERE name = $1"
+    // Значение name передаётся ОТДЕЛЬНО от SQL-текста.
+    // PostgreSQL обрабатывает его как ДАННЫЕ, а не как SQL-код.
+    return db.QueryRow(query, name).Scan(...)
+}
+```
+
+**Почему это безопасно:**
+
+```
+Пользователь вводит:
+  '; DROP TABLE users; --
+
+Параметризованный запрос:
+  SELECT * FROM users WHERE name = $1;
+
+PostgreSQL получает:
+  Параметр $1 = "'; DROP TABLE users; --"
+
+PostgreSQL ищет строку с name РАВНЫМ этой строке.
+Он НЕ интерпретирует её как SQL-код.
+Это просто ДАННЫЕ.
+```
+
+### Как это работает под капотом
+
+Вспомни Главу 1: PostgreSQL Wire Protocol поддерживает **подготовленные запросы** (prepared statements).
+
+```
+Параметризованный запрос в Go:
+
+  1. Go-драйвер (pgx) отправляет SQL с плейсхолдерами:
+     Parse: "SELECT * FROM users WHERE name = $1"
+
+  2. PostgreSQL разбирает SQL и создаёт план запроса.
+     На этом этапе $1 — это «параметр», а не значение.
+
+  3. Go-драйвер отправляет значение параметра ОТДЕЛЬНО:
+     Bind: $1 = "'; DROP TABLE users; --"
+
+  4. PostgreSQL подставляет значение как ДАННЫЕ.
+     Оно НЕ может быть интерпретировано как SQL-код.
+
+  5. Execute: выполняется запрос с параметром.
+```
+
+**Ключевой момент:** SQL-текст и данные **разделены** на уровне протокола. PostgreSQL разбирает SQL **до** получения данных. Данные не могут изменить структуру запроса.
+
+### Правила безопасности
+
+**✅ ОБЯЗАТЕЛЬНО:**
+
+1. **Всегда параметризируй запросы с пользовательскими данными:**
+   ```go
+   db.Query("SELECT * FROM users WHERE name = $1", name)
+   db.Exec("UPDATE users SET email = $1 WHERE id = $2", email, id)
+   ```
+
+2. **Никогда не конкатенируй строки для SQL:**
+   ```go
+   // ❌ НИКОГДА ТАК НЕ ДЕЛАЙ:
+   query := "SELECT * FROM users WHERE name = '" + name + "'"
+   ```
+
+**👍 СТОИТ:**
+
+3. **Используй pgx с нативными типами:**
+   ```go
+   var id int64 = 42
+   db.Query("SELECT * FROM users WHERE id = $1", id)  // передаётся как bigint
+   ```
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не «экранируй» вручную** — параметризация надёжнее:
+   ```go
+   // ❌ Плохо: ручное экранирование
+   escapedName := strings.ReplaceAll(name, "'", "''")
+   query := "SELECT * FROM users WHERE name = '" + escapedName + "'"
+   ```
+
+5. **Не параметризируй имя таблицы или колонки** — параметризация только для **значений**:
+   ```go
+   // ❌ Не работает: $1 не может быть именем таблицы
+   db.Query("SELECT * FROM $1 WHERE id = 42", "users")
+   
+   // ✅ Правильно: имена таблиц/колонок — только из доверенного источника
+   table := "users"  // из белого списка, а не от пользователя
+   db.Query(fmt.Sprintf("SELECT * FROM %s WHERE id = $1", table), 42)
+   ```
+
+### Итог подглавы 8.10
+
+- **SQL-инъекция** — вставка SQL-кода через пользовательские данные.
+- **Параметризация** — значения передаются отдельно от SQL-текста.
+- **Протокол** — PostgreSQL разбирает SQL до получения данных (Parse → Bind → Execute).
+- **Правило:** всегда параметризируй **значения**, никогда не параметризируй **имена таблиц/колонок**.
+
+---
+
+## 8.11 Batch insert: массовые вставки эффективно
+
+В подглаве 8.2 мы разобрали обычный `INSERT`. Но если нужно вставить **тысячи или миллионы строк** — обычные INSERT'ы по одному будут **очень медленными**.
+
+### Проблема: INSERT по одному
+
+```go
+// ❌ Медленно: 10 000 отдельных INSERT'ов
+for _, user := range users {
+    db.Exec("INSERT INTO users (name, email) VALUES ($1, $2)", user.Name, user.Email)
+}
+// Каждый INSERT:
+//   - Отдельный сетевой round-trip (Go → PostgreSQL → Go)
+//   - Отдельный Parse → Plan → Execute
+//   - Отдельный WAL-запись (Глава 1)
+//   - Отдельное обновление индексов (Глава 3)
+// 10 000 INSERT'ов = 10 000 round-trips = очень медленно!
+```
+
+### Решение: batch insert
+
+**Batch insert** — вставка **многих строк одним запросом**.
+
+```sql
+-- Один INSERT с многими VALUES:
+INSERT INTO users (name, email) VALUES
+    ('Alice', 'alice@mail.com'),
+    ('Bob', 'bob@mail.com'),
+    ('Charlie', 'charlie@mail.com'),
+    ...  -- ещё 9997 строк
+;
+```
+
+**Почему это быстро:**
+
+- **Один** сетевой round-trip.
+- **Один** Parse → Plan → Execute.
+- **Одна** WAL-запись (или меньше записей).
+- **Одно** обновление индексов (более эффективное).
+
+### Как сделать batch insert в Go
+
+**Способ 1: pgx.Batch (нативная поддержка)**
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+
+    "github.com/jackc/pgx/v5"
+)
+
+type User struct {
+    Name  string
+    Email string
+}
+
+func main() {
+    ctx := context.Background()
+
+    conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close(ctx)
+
+    users := []User{
+        {"Alice", "alice@mail.com"},
+        {"Bob", "bob@mail.com"},
+        {"Charlie", "charlie@mail.com"},
+        // ... ещё тысячи
+    }
+
+    // Batch — пакетная вставка
+    batch := &pgx.Batch{}
+    for _, u := range users {
+        batch.Queue(
+            "INSERT INTO users (name, email) VALUES ($1, $2)",
+            u.Name, u.Email,
+        )
+    }
+
+    // Отправляем все INSERT'ы одним вызовом
+    results := conn.SendBatch(ctx, batch)
+    defer results.Close()
+
+    // Проверяем результаты
+    for range users {
+        _, err := results.Exec()
+        if err != nil {
+            log.Fatal(err)
+        }
+    }
+
+    fmt.Printf("Вставлено %d пользователей\n", len(users))
+}
+```
+
+**Способ 2: Multi-VALUES INSERT (один SQL-запрос)**
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+    "strings"
+
+    "github.com/jackc/pgx/v5"
+)
+
+func main() {
+    ctx := context.Background()
+
+    conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close(ctx)
+
+    users := []User{
+        {"Alice", "alice@mail.com"},
+        {"Bob", "bob@mail.com"},
+        {"Charlie", "charlie@mail.com"},
+        // ... ещё тысячи
+    }
+
+    // Строим один INSERT с многими VALUES
+    const batchSize = 1000  // по 1000 строк за запрос
+    
+    for start := 0; start < len(users); start += batchSize {
+        end := start + batchSize
+        if end > len(users) {
+            end = len(users)
+        }
+        chunk := users[start:end]
+
+        // INSERT INTO users (name, email) VALUES ($1,$2),($3,$4),($5,$6),...
+        placeholders := make([]string, 0, len(chunk))
+        args := make([]interface{}, 0, len(chunk)*2)
+        
+        for i, u := range chunk {
+            placeholders = append(placeholders, fmt.Sprintf("($%d,$%d)", i*2+1, i*2+2))
+            args = append(args, u.Name, u.Email)
+        }
+
+        query := "INSERT INTO users (name, email) VALUES " + strings.Join(placeholders, ",")
+        
+        _, err := conn.Exec(ctx, query, args...)
+        if err != nil {
+            log.Fatal(err)
+        }
+    }
+
+    fmt.Printf("Вставлено %d пользователей\n", len(users))
+}
+```
+
+**Способ 3: COPY FROM (самый быстрый)**
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
+
+    "github.com/jackc/pgx/v5"
+)
+
+func main() {
+    ctx := context.Background()
+
+    conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close(ctx)
+
+    // COPY — самый быстрый способ массовой вставки
+    rows := [][]interface{}{
+        {"Alice", "alice@mail.com"},
+        {"Bob", "bob@mail.com"},
+        {"Charlie", "charlie@mail.com"},
+        // ... ещё миллионы
+    }
+
+    copied, err := conn.CopyFrom(
+        ctx,
+        pgx.Identifier{"users"},           // таблица
+        []string{"name", "email"},          // колонки
+        pgx.CopyFromRows(rows),             // данные
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Вставлено %d строк через COPY\n", copied)
+}
+```
+
+### Сравнение скорости
+
+| Способ | 100 000 строк | Примечание |
+|:---|:---|:---|
+| INSERT по одному | **30-60 сек** | 100 000 round-trips |
+| pgx.Batch | **2-5 сек** | Один round-trip, но много отдельных INSERT |
+| Multi-VALUES INSERT | **1-3 сек** | Один SQL-запрос с многими VALUES |
+| COPY FROM | **< 1 сек** | Самый быстрый, минимальный оверхед |
+
+### Что происходит под капотом при COPY
+
+Вспомни Главу 1: `COPY` использует **потоковую передачу** через Wire Protocol — данные идут непрерывным потоком, а не отдельными сообщениями.
+
+**COPY FROM:**
+
+```
+1. Backend-процесс получает данные непрерывным потоком.
+2. Для каждой строки:
+   - Создаёт кортеж (Глава 2).
+   - Записывает WAL (Глава 1) — но эффективнее, чем отдельные INSERT.
+   - Обновляет индексы (Глава 3) — батчами.
+3. В конце: WAL-запись о завершении COPY.
+```
+
+**Почему быстрее:** нет накладных расходов на Parse/Plan для каждой строки, меньше WAL-записей, меньше переключений контекста.
+
+### 💡 Практика: batch insert
+
+**✅ ОБЯЗАТЕЛЬНО:**
+
+1. **Для массовых вставок (> 1000 строк) используй batch:**
+   - `pgx.Batch` — для обычных INSERT'ов.
+   - `Multi-VALUES INSERT` — по 500-1000 строк за запрос.
+   - `COPY FROM` — для максимальной скорости.
+
+2. **Разбивай на батчи по 500-1000 строк:**
+   ```go
+   const batchSize = 1000
+   ```
+
+**👍 СТОИТ:**
+
+3. **Используй транзакцию для batch insert:**
+   ```go
+   tx, _ := conn.Begin(ctx)
+   defer tx.Rollback(ctx)
+   // batch insert...
+   tx.Commit(ctx)
+   ```
+
+**🤔 НЕ ОБЯЗАТЕЛЬНО:**
+
+4. **Для < 100 строк — обычные INSERT'ы достаточно быстры.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не вставляй миллионы строк одним INSERT** — огромный запрос может упереться в лимиты памяти и WAL.
+
+6. **Не используй COPY для таблиц с триггерами** — COPY может пропускать триггеры (зависит от настроек).
+
+### Итог подглавы 8.11
+
+- **Batch insert** — вставка многих строк одним запросом.
+- **pgx.Batch** — пакетная отправка INSERT'ов.
+- **Multi-VALUES INSERT** — один SQL с многими VALUES.
+- **COPY FROM** — самый быстрый способ.
+- **Разбивай на батчи** по 500-1000 строк.
+- **Используй транзакцию** для согласованности.
+
+---
+
+## 8.12 Практика Go: работа с SQL в коде
 
 ```go
 package main
@@ -792,22 +1254,22 @@ func main() {
 
     ctx := context.Background()
 
-    // INSERT с RETURNING
+    // INSERT с RETURNING (параметризованный!)
     var userID int64
     err = db.QueryRowContext(ctx,
         "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id",
-        "Alice", "alice@mail.com",
+        "Alice", "alice@mail.com",  // ← параметры, не конкатенация!
     ).Scan(&userID)
     fmt.Printf("Создан пользователь id=%d\n", userID)
 
-    // SELECT с фильтром
+    // SELECT с фильтром (параметризованный!)
     var user User
     err = db.QueryRowContext(ctx,
         "SELECT id, name, COALESCE(email, '') FROM users WHERE id = $1",
-        userID,
+        userID,  // ← параметр
     ).Scan(&user.ID, &user.Name, &user.Email)
 
-    // Keyset пагинация
+    // Keyset пагинация (параметризованная!)
     products, lastID, _ := getProducts(ctx, db, 0, 10)
     fmt.Printf("Загружено %d товаров, lastID=%d\n", len(products), lastID)
 }
@@ -815,7 +1277,7 @@ func main() {
 func getProducts(ctx context.Context, db *sql.DB, afterID int64, limit int) ([]string, int64, error) {
     rows, err := db.QueryContext(ctx,
         "SELECT id, name FROM products WHERE id > $1 ORDER BY id LIMIT $2",
-        afterID, limit,
+        afterID, limit,  // ← параметры
     )
     if err != nil {
         return nil, 0, err
@@ -837,11 +1299,11 @@ func getProducts(ctx context.Context, db *sql.DB, afterID int64, limit int) ([]s
 
 ---
 
-## 8.11 Выводы и типичные ошибки
+## 8.13 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-SQL — декларативный язык: ты говоришь «что», а PostgreSQL — «как». Но понимание «как» (индексы, MVCC, VACUUM) помогает писать эффективные запросы.
+SQL — декларативный язык: ты говоришь «что», а PostgreSQL — «как». Но понимание «как» (индексы, MVCC, VACUUM) помогает писать эффективные запросы. Параметризация защищает от SQL-инъекций. Batch insert ускоряет массовые вставки в десятки раз.
 
 **Типичные ошибки:**
 
@@ -852,10 +1314,13 @@ SQL — декларативный язык: ты говоришь «что», �
 - ❌ UPDATE без WHERE — массовое создание мёртвых кортежей.
 - ❌ FK без индекса — Seq Scan на JOIN.
 - ❌ DISTINCT без необходимости — дорогая сортировка.
+- ❌ Конкатенация строк для SQL — SQL-инъекция. Всегда параметризируй.
+- ❌ INSERT по одному в цикле — используй batch insert.
+- ❌ Параметризация имён таблиц — параметризируются только **значения**.
 
 ---
 
-## 8.12 Для быстрого повторения
+## 8.14 Для быстрого повторения
 
 - **Порядок выполнения:** FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT.
 - **JOIN'ы:** INNER (совпадения), LEFT (все из левой), FULL (все), CROSS (декарт), LATERAL (подзапрос с доступом).
@@ -866,10 +1331,12 @@ SQL — декларативный язык: ты говоришь «что», �
 - **Пагинация:** Keyset для больших таблиц, OFFSET для маленьких.
 - **UPSERT:** ON CONFLICT DO UPDATE / DO NOTHING.
 - **TRUNCATE** — мгновенно, не создаёт мёртвых кортежей.
+- **Параметризация** — значения отдельно от SQL-текста, защита от инъекций.
+- **Batch insert** — pgx.Batch, Multi-VALUES, COPY FROM. Разбивай на батчи 500-1000.
 
 ---
 
-## 8.13 Вопросы для самопроверки
+## 8.15 Вопросы для самопроверки
 
 1. Какой порядок выполнения операторов в SELECT?
 2. Чем LEFT JOIN отличается от INNER JOIN?
@@ -881,10 +1348,13 @@ SQL — декларативный язык: ты говоришь «что», �
 8. Как работает Keyset pagination?
 9. Что делает UPDATE под капотом?
 10. Почему FK не создаёт индекс автоматически?
+11. Что такое SQL-инъекция? Как параметризация защищает от неё?
+12. Что такое batch insert? Какие способы batch insert есть в Go?
+13. Почему COPY FROM быстрее, чем INSERT по одному?
 
 ---
 
-## 8.14 Ответы
+## 8.16 Ответы
 
 ### Ответ 1
 
@@ -926,9 +1396,21 @@ UPDATE создаёт новую версию строки (t_xmin), помеч�
 
 Потому что REFERENCES проверяет существование в **другой** таблице (по её PK). Для фильтрации по FK-колонке индекс нужно создавать вручную.
 
+### Ответ 11
+
+SQL-инъекция — атака, при которой злоумышленник вставляет SQL-код через пользовательские данные. Параметризация защищает: SQL-текст разбирается **до** получения данных (Parse → Bind → Execute), данные передаются отдельно и не могут изменить структуру запроса.
+
+### Ответ 12
+
+Batch insert — вставка многих строк одним запросом. Способы в Go: `pgx.Batch` (пакетная отправка), Multi-VALUES INSERT (один SQL с многими VALUES), `COPY FROM` (самый быстрый). Разбивать на батчи по 500-1000 строк.
+
+### Ответ 13
+
+COPY FROM использует потоковую передачу через Wire Protocol — данные идут непрерывным потоком. Нет накладных расходов на Parse/Plan для каждой строки, меньше WAL-записей, эффективнее обновление индексов.
+
 ---
 
-## 8.15 Куда идти дальше?
+## 8.17 Куда идти дальше?
 
 Мы разобрали **как писать SQL**. Теперь — **как PostgreSQL выполняет** эти запросы на уровне алгоритмов.
 
