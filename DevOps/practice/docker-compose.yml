@@ -1,0 +1,15 @@
+# docker-compose.yml
+services:
+  devops-lab:
+    image: ubuntu:24.04
+    container_name: devops-lab
+    hostname: devops-lab
+    restart: unless-stopped
+    ports:
+      - "2222:22"
+    volumes:
+      - ./workspace:/workspace
+    environment:
+      - DEBIAN_FRONTEND=noninteractive
+      - TZ=Europe/Warsaw
+    command: bash -c "apt-get update && apt-get install -y --no-install-recommends openssh-server sudo curl wget git vim nano htop net-tools iproute2 iputils-ping dnsutils telnet tcpdump strace lsof sysstat procps psmisc ca-certificates bash-completion jq tree unzip tar gzip bzip2 xz-utils && mkdir -p /run/sshd && ssh-keygen -A && echo 'root:root' | chpasswd && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && /usr/sbin/sshd -D"

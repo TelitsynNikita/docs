@@ -1,0 +1,16 @@
+services:
+  linux-practice:
+    image: ubuntu:24.04
+    container_name: linux-practice
+    privileged: true
+    cap_add:
+      - ALL
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./practice:/root/practice
+    cgroup: host
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: bash
+  
