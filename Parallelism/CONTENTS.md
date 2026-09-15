@@ -1,0 +1,16 @@
+# Параллелизм в Go детально
+
+[Глава 1: Горутины — лёгкие потоки, которые меняют всё](chapter1.md)  
+[Глава 2: Каналы — типизированные трубы для обмена данными](chapter2.md)  
+[Глава 3: Синхронизация — Mutex, RWMutex, atomic, WaitGroup](chapter3.md)  
+[Глава 4: Memory model и data race — что происходит на самом деле](chapter4.md)  
+[Глава 5: Context — отмена, таймауты, дедлайны](chapter5.md)  
+[Глава 6: Планировщик Go — G-M-P, work stealing, preemption](chapter6.md)  
+[Глава 7: Worker pool — ограничение параллелизма](chapter7.md)  
+[Глава 8: Fan-in, Fan-out, Pipeline — конвейеры данных](chapter8.md)  
+[Глава 9: Продвинутые паттерны — semaphore, rate limiter, circuit breaker](chapter9.md)  
+[Глава 10: Обработка ошибок в конкурентном коде](chapter10.md)  
+[Глава 11: Graceful shutdown — корректное завершение](chapter11.md)  
+[Глава 12: Тестирование и профилирование конкурентного кода](chapter12.md)  
+[Глава 13: Анти-паттерны и типичные ошибки](chapter13.md)  
+[Глава 14: Реальные сценарии — HTTP-сервер, очереди, ETL, scraping](chapter14.md)  
