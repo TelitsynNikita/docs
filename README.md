@@ -6,3 +6,4 @@
 [-> Документация по Компьютерным сетям](ComputerNetworks/CONTENTS.md)  
 [-> Документация по Linux и системному администрированию](Linux/CONTENTS.md)  
 [-> Документация по Алгоритмам и структурам данных](Algorithms/CONTENTS.md)  
+[-> Документация по Кафке](Kafka/CONTENTS.md)  
