@@ -8,3 +8,4 @@
 [-> Документация по Алгоритмам и структурам данных](Algorithms/CONTENTS.md)  
 [-> Документация по Кафке](Kafka/CONTENTS.md)  
 [-> Документация по Параллелизму](Parallelism/CONTENTS.md)  
+[-> Математика](Math/CONTENTS.md)  
