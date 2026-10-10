@@ -1,1813 +1,1506 @@
-# 🌍 Глава 14: Реальные сценарии — HTTP, очереди, ETL, scraping
+# ⏱️ Глава 14: Rate limiter — token bucket
 
 **Что вы узнаете:**
-- Как построить **production-ready HTTP-сервер** с ограничением параллелизма.
-- Как обрабатывать **очереди** (Kafka, NATS, RabbitMQ) с worker pool.
-- Как построить **ETL-пайплайн** с backpressure и batch.
-- Как написать **scraper** с rate limiter и circuit breaker.
-- Как комбинировать все паттерны в **одном сервисе**.
-- Как **диагностировать** production-проблемы.
-- Как **тестировать** реальные сценарии.
-- Как **не повторять** анти-паттерны из Главы 13.
+- Что такое rate limiter и какую задачу он решает.
+- Чем rate limiter отличается от semaphore и worker pool.
+- Как построить простейший rate limiter на `time.Ticker`.
+- Как построить token bucket с нуля.
+- Что такое burst и зачем он нужен.
+- Как использовать `golang.org/x/time/rate`.
+- Как добавить отмену через `context`.
+- Как комбинировать rate limiter с worker pool, pipeline, circuit breaker.
 
 **После прочтения вы сможете:**
-- Построить HTTP-сервер с graceful shutdown и rate limiting.
-- Обработать очередь с worker pool и drain.
-- Построить ETL с backpressure и batch.
-- Написать scraper с rate limiter и circuit breaker.
-- Комбинировать паттерны в одном сервисе.
-- Диагностировать утечки, contention, backpressure.
-- Писать тесты для реальных сценариев.
+- Построить rate limiter с нуля.
+- Ограничивать скорость операций.
+- Настраивать burst для пиков.
+- Использовать `golang.org/x/time/rate` в production.
+- Комбинировать rate limiter с другими паттернами.
 
 ---
 
 ## Содержание
 
-- [14.0 Пролог: сервис, который выжил в production](#140-пролог-сервис-который-выжил-в-production)
-- [14.1 HTTP-сервер с ограничением параллелизма](#141-http-сервер-с-ограничением-параллелизма)
-- [14.2 Очереди: Kafka, NATS, RabbitMQ](#142-очереди-kafka-nats-rabbitmq)
-- [14.3 ETL-пайплайн с batch и backpressure](#143-etl-пайплайн-с-batch-и-backpressure)
-- [14.4 Scraper с rate limiter и circuit breaker](#144-scraper-с-rate-limiter-и-circuit-breaker)
-- [14.5 Комбинированный сервис: всё вместе](#145-комбинированный-сервис-всё-вместе)
-- [14.6 Диагностика production-проблем](#146-диагностика-production-проблем)
-- [14.7 Тестирование реальных сценариев](#147-тестирование-реальных-сценариев)
-- [14.8 Выводы и типичные ошибки](#148-выводы-и-типичные-ошибки)
-- [14.9 Для быстрого повторения](#149-для-быстрого-повторения)
-- [14.10 Вопросы для самопроверки](#1410-вопросы-для-самопроверки)
-- [14.11 Ответы](#1411-ответы)
-- [14.12 Куда идти дальше?](#1412-куда-идти-дальше)
-- [14.13 Чек-лист](#1413-чек-лист)
+- [14.0 Пролог: сервис, который положил внешний API](#140-пролог-сервис-который-положил-внешний-api)
+- [14.1 Что такое rate limiter](#141-что-такое-rate-limiter)
+- [14.2 Простейший rate limiter на time.Ticker](#142-простейший-rate-limiter-на-timeticker)
+- [14.3 Token bucket с нуля](#143-token-bucket-с-нуля)
+- [14.4 Burst: зачем нужен](#144-burst-зачем-нужен)
+- [14.5 golang.org/x/time/rate](#145-golangorgxtimerate)
+- [14.6 Rate limiter с context](#146-rate-limiter-с-context)
+- [14.7 В связке с другими паттернами](#147-в-связке-с-другими-паттернами)
+- [14.8 Практика Go: rate limiter с метриками](#148-практика-go-rate-limiter-с-метриками)
+- [14.9 Выводы и типичные ошибки](#149-выводы-и-типичные-ошибки)
+- [14.10 Для быстрого повторения](#1410-для-быстрого-повторения)
+- [14.11 Вопросы для самопроверки](#1411-вопросы-для-самопроверки)
+- [14.12 Ответы](#1412-ответы)
+- [14.13 Куда идти дальше?](#1413-куда-идти-дальше)
+- [14.14 Чек-лист](#1414-чек-лист)
 
 ---
 
-## 14.0 Пролог: сервис, который выжил в production
+## 14.0 Пролог: сервис, который положил внешний API
 
-Ты пишешь production-ready сервис. Требования:
+У нас есть сервис, который ходит за обогащением в другой сервис. Работает так: получает 10 000 ID, делает HTTP-запрос на каждый.
 
-- **HTTP API** для клиентов.
-- **Очередь** (Kafka) для событий.
-- **ETL** для обработки данных.
-- **Scraper** для внешних источников.
-- **Graceful shutdown** по `SIGTERM`.
-- **Метрики** в Prometheus.
-- **Логи** в stdout.
-- **Traces** в Jaeger.
-
-**Что нужно:**
-
-- HTTP-сервер с ограничением параллелизма.
-- Worker pool для очереди.
-- Pipeline для ETL.
-- Rate limiter и circuit breaker для scraper.
-- Graceful shutdown для всего.
-- Метрики, логи, трейсы.
-
-**Это глава о том, как собрать всё вместе.**
-
-> **Важный мост:** эта глава — **синтез** всех предыдущих. HTTP-сервер (Глава 11), очереди (Глава 7), ETL (Глава 8), scraping (Глава 9). Все паттерны комбинируются.
-
----
-
-## 14.1 HTTP-сервер с ограничением параллелизма
-
-Построим **production-ready HTTP-сервер**.
-
-### Требования
-
-1. **Graceful shutdown** по `SIGTERM`/`SIGINT`.
-2. **Ограничение параллелизма** — не более N одновременных запросов.
-3. **Таймауты** на чтение, запись, idle.
-4. **Rate limiting** на клиента.
-5. **Метрики** (Prometheus).
-6. **Structured logging** (`slog`).
-7. **Health checks** (`/healthz`, `/readyz`).
-
-### Шаг 1: структура
+Пишем через worker pool (Глава 13):
 
 ```go
-type Server struct {
-    httpSrv *http.Server
-    sem     chan struct{}      // семафор для ограничения
-    limiter *rate.Limiter      // rate limiter
-}
-```
-
-### Шаг 2: создание сервера
-
-```go
-func NewServer(addr string, maxConcurrent int, rps int) *Server {
-    s := &Server{
-        sem:     make(chan struct{}, maxConcurrent),
-        limiter: rate.NewLimiter(rate.Limit(rps), rps*2),
-    }
-
-    mux := http.NewServeMux()
-    mux.HandleFunc("/", s.handleRoot)
-    mux.HandleFunc("/healthz", s.handleHealth)
-    mux.HandleFunc("/readyz", s.handleReady)
-    mux.Handle("/metrics", promhttp.Handler())
-
-    s.httpSrv = &http.Server{
-        Addr:         addr,
-        Handler:      s.middleware(mux),
-        ReadTimeout:  5 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-
-    return s
-}
-```
-
-### Шаг 3: middleware
-
-```go
-func (s *Server) middleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Rate limiting
-        if !s.limiter.Allow() {
-            http.Error(w, "too many requests", http.StatusTooManyRequests)
-            return
-        }
-
-        // Ограничение параллелизма
-        select {
-        case s.sem <- struct{}{}:
-            defer func() { <-s.sem }()
-        case <-r.Context().Done():
-            return
-        case <-time.After(1 * time.Second):
-            http.Error(w, "server busy", http.StatusServiceUnavailable)
-            return
-        }
-
-        next.ServeHTTP(w, r)
-    })
-}
-```
-
-### Шаг 4: обработчики
-
-```go
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-    select {
-    case <-r.Context().Done():
-        return
-    case <-time.After(100 * time.Millisecond):
-        fmt.Fprintln(w, "hello")
-    }
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    fmt.Fprintln(w, "ok")
-}
-
-func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    fmt.Fprintln(w, "ready")
-}
-```
-
-### Шаг 5: запуск и shutdown
-
-```go
-func (s *Server) Run(ctx context.Context) error {
-    errCh := make(chan error, 1)
-    go func() {
-        slog.Info("server starting", "addr", s.httpSrv.Addr)
-        if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-            errCh <- err
-        }
-        close(errCh)
-    }()
-
-    select {
-    case <-ctx.Done():
-        slog.Info("shutdown signal received")
-    case err := <-errCh:
-        return err
-    }
-
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-    defer cancel()
-
-    if err := s.httpSrv.Shutdown(shutdownCtx); err != nil {
-        slog.Error("shutdown error", "error", err)
-        s.httpSrv.Close()
-        return err
-    }
-    return nil
-}
-```
-
-### Шаг 6: main
-
-```go
-func main() {
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-    slog.SetDefault(logger)
-
-    ctx, stop := signal.NotifyContext(context.Background(),
-        syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    srv := NewServer(":8080", 100, 1000)
-
-    if err := srv.Run(ctx); err != nil {
-        slog.Error("run failed", "error", err)
-        os.Exit(1)
-    }
-    slog.Info("shutdown complete")
-}
-```
-
-### Что демонстрирует
-
-1. **Семафор** — не более 100 одновременных запросов.
-2. **Rate limiter** — не более 1000 запросов/сек.
-3. **Graceful shutdown** — по сигналу.
-4. **Health checks** — `/healthz`, `/readyz`.
-5. **Метрики** — `/metrics`.
-6. **Structured logging** — `slog`.
-
-### Аннотация сложности
-
-| Компонент | Time | Space |
-|:---|:---|:---|
-| Middleware | ~100-200 нс | 0 |
-| Семафор | ~30-70 нс | 0 |
-| Rate limiter | ~50-100 нс | 0 |
-| Обработчик | зависит | зависит |
-| Shutdown | 0-25 сек | 0 |
-
-### 💡 Практика: как строить production HTTP
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Graceful shutdown** — по сигналу.
-2. **Семафор** — для ограничения параллелизма.
-3. **Rate limiter** — для защиты от DDoS.
-4. **Таймауты** — Read, Write, Idle.
-5. **Health checks.**
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-6. **Метрики** — Prometheus.
-7. **Structured logging** — `slog`.
-8. **Middleware** — для cross-cutting concerns.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-9. **Tracing** — OpenTelemetry.
-
-**❌ НЕ ДЕЛАЙ:**
-
-10. **Не блокируй хэндлер** — `select` + `default`.
-11. **Не забывай `ctx.Done()`** в долгих обработчиках.
-12. **Не используй `os.Exit`** в Run.
-
-### Ключевые выводы подглавы 14.1
-
-- **Семафор** — ограничение параллелизма.
-- **Rate limiter** — защита от DDoS.
-- **Graceful shutdown** — по сигналу.
-- **Health checks** — `/healthz`, `/readyz`.
-- **Метрики, логи** — обязательны.
-
----
-
-## 14.2 Очереди: Kafka, NATS, RabbitMQ
-
-Построим **consumer** для очереди.
-
-### Требования
-
-1. **Worker pool** — N воркеров.
-2. **Graceful shutdown** — drain перед закрытием.
-3. **Batch commit** — для производительности.
-4. **Retry** — для временных ошибок.
-5. **Dead letter queue** — для постоянных ошибок.
-6. **Метрики** — сколько обработано, сколько упало.
-
-### Шаг 1: структура
-
-```go
-type Consumer struct {
-    consumer  MessageConsumer
-    workers   int
-    batchSize int
-    metrics   *Metrics
-}
-
-type Message struct {
-    ID   string
-    Body []byte
-}
-
-type MessageConsumer interface {
-    Read(ctx context.Context) (Message, error)
-    Commit(ctx context.Context, msgs []Message) error
-    Close() error
-}
-```
-
-### Шаг 2: запуск
-
-```go
-func (c *Consumer) Run(ctx context.Context) error {
-    messagesCh := make(chan Message, c.batchSize*2)
-
+func fetchAll(ids []int, numWorkers int) {
+    idsCh := make(chan int, len(ids))
+    
     var wg sync.WaitGroup
-    for i := 0; i < c.workers; i++ {
+    for i := 0; i < numWorkers; i++ {
         wg.Add(1)
         go func() {
             defer wg.Done()
-            c.worker(ctx, messagesCh)
+            for id := range idsCh {
+                resp, err := http.Get(fmt.Sprintf("https://api.example.com/users/%d", id))
+                // обработка
+            }
         }()
     }
-
-    // Reader
-    readerDone := make(chan struct{})
-    go func() {
-        defer close(readerDone)
-        defer close(messagesCh)
-        c.reader(ctx, messagesCh)
-    }()
-
-    <-ctx.Done()
-    slog.Info("shutdown signal received, draining")
-
-    <-readerDone
-    wg.Wait()
-
-    if err := c.consumer.Close(); err != nil {
-        slog.Error("close error", "error", err)
-        return err
+    
+    for _, id := range ids {
+        idsCh <- id
     }
-    return nil
+    close(idsCh)
+    wg.Wait()
 }
 ```
 
-### Шаг 3: reader
+Работает. Но через 30 секунд приходит письмо от внешнего сервиса:
+
+> «Ваш сервис превысил лимит: 10 000 запросов в секунду. Мы заблокировали ваш API-ключ на 24 часа.»
+
+Хочется понять, что произошло. У нас **20 воркеров**. Значит, одновременно не более 20 запросов. Но если каждый занимает **1 мс**, то за секунду проходит **20 000** запросов. Внешний сервис **не выдержал**.
+
+Проблема в том, что worker pool ограничивает **параллелизм** (число одновременных операций), но не **скорость** (число операций за период).
+
+Хочется: **не более 100 запросов в секунду**, независимо от latency и числа воркеров.
+
+Это и есть **rate limiter**.
+
+> **Мост к следующим главам:** rate limiter — важный инструмент для защиты внешних сервисов. Он часто используется вместе с worker pool (Глава 13) и circuit breaker (Глава 15). Понимание rate limiter даёт понимание, **как не положить чужие сервисы**.
+
+---
+
+## 14.1 Что такое rate limiter
+
+**Rate limiter** — примитив, который ограничивает **скорость** операций (сколько за период).
+
+### Rate limiter vs semaphore и worker pool
+
+| Аспект | Semaphore | Worker pool | Rate limiter |
+|:---|:---|:---|:---|
+| Что ограничивает | Параллелизм | Параллелизм | Скорость |
+| Единица | Одновременные операции | Число воркеров | Операции в секунду |
+| Пример | 10 одновременно | 20 воркеров | 100/сек |
+| Когда | Ограничить ресурс | Много задач | Внешний API |
+
+**Ключевое:** semaphore и worker pool ограничивают **сколько одновременно**. Rate limiter — **сколько за период**.
+
+### Пример разницы
+
+**Worker pool N=10:** 10 одновременных запросов. Если каждый длится 100 мс — 100 запросов/сек. Если 1 мс — 10 000 запросов/сек.
+
+**Rate limiter 100/сек:** 100 запросов/сек, независимо от параллелизма. Если каждый длится 1 мс — 100 запросов/сек. Если 1 секунду — тоже 100 запросов/сек.
+
+**Оба паттерна нужны.** Часто — **вместе**.
+
+### Когда использовать rate limiter
+
+**1. Внешний API с лимитом.**
+
+- «Не более 100 запросов в секунду.»
+- «Не более 10 000 в час.»
+
+**2. Защита от DDoS.**
+
+- Ограничить запросы от одного клиента.
+- Ограничить запросы к внутреннему сервису.
+
+**3. Экономия ресурсов.**
+
+- Не перегружать БД.
+- Не перегружать CPU.
+
+**4. Плавный старт.**
+
+- Постепенно увеличивать нагрузку.
+
+### Когда НЕ использовать rate limiter
+
+**1. Внутренние операции.**
+
+Rate limiter добавляет latency. Для внутренних операций — не нужен.
+
+**2. Одиночные операции.**
+
+Для редких операций — overhead.
+
+**3. Если важна пропускная способность.**
+
+Rate limiter **ограничивает** — если нужна максимальная пропускная способность, не подходит.
+
+### Два алгоритма
+
+**Token bucket** — основный в Go (`golang.org/x/time/rate`).
+
+**Leaky bucket** — для строгого сглаживания.
+
+Разберём **token bucket**.
+
+### 💡 Практика: как думать о rate limiter
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Rate limiter — для внешних API.**
+2. **Worker pool + rate limiter — для production.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Проверяй лимиты внешнего сервиса.**
+4. **Настраивай burst.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не путай rate limiter с worker pool.**
+6. **Не используй rate limiter для внутренних операций.**
+
+---
+
+## 14.2 Простейший rate limiter на time.Ticker
+
+Начнём с простейшего — `time.Ticker`.
+
+### Идея
+
+`time.Ticker` отправляет значение в канал **каждые N миллисекунд**. Мы используем это как «разрешение».
 
 ```go
-func (c *Consumer) reader(ctx context.Context, out chan<- Message) {
+limiter := time.Tick(100 * time.Millisecond)
+
+for _, task := range tasks {
+    <-limiter  // ждём разрешения
+    process(task)
+}
+```
+
+**Что происходит:**
+
+- `time.Tick(100ms)` создаёт канал, куда каждые 100 мс отправляется время.
+- `<-limiter` ждёт очередного «тика».
+- Скорость: **10 операций в секунду**.
+
+### Полный код
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    limiter := time.Tick(100 * time.Millisecond)
+    
+    start := time.Now()
+    for i := 0; i < 10; i++ {
+        <-limiter
+        fmt.Printf("[%v] processing %d\n", time.Since(start).Round(time.Millisecond), i)
+    }
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] processing 0
+[100ms] processing 1
+[200ms] processing 2
+[300ms] processing 3
+...
+[900ms] processing 9
+```
+
+**Что видно:** одна операция каждые 100 мс = 10 операций в секунду.
+
+### Проблема: time.Tick не останавливается
+
+**❌ Плохо:**
+
+```go
+limiter := time.Tick(100 * time.Millisecond)
+// ... используем, потом забываем
+```
+
+**Что происходит:** `time.Tick` создаёт таймер, который **никогда не останавливается**. Даже если `limiter` больше не используется — таймер живёт. **Утечка.**
+
+### Решение: time.NewTicker
+
+```go
+ticker := time.NewTicker(100 * time.Millisecond)
+defer ticker.Stop()
+
+for _, task := range tasks {
+    <-ticker.C
+    process(task)
+}
+```
+
+**Что изменилось:** `ticker.Stop()` освобождает таймер.
+
+### Проблема: нет burst
+
+**Что если 5 секунд не было операций, а потом нужно 10 сразу?**
+
+`time.Tick` **не накапливает** разрешения. Если ты не читал из канала — разрешения **потеряны**. Можно получить только **одно** разрешение за тик.
+
+**Пример:**
+
+```go
+limiter := time.Tick(100 * time.Millisecond)
+
+// Ждём 5 секунд
+time.Sleep(5 * time.Second)
+
+// Делаем 10 запросов подряд
+for i := 0; i < 10; i++ {
+    <-limiter  // ← каждый ждёт 100 мс
+    process(i)
+}
+```
+
+**Что происходит:** 5 секунд простоя **не накапливаются**. Все 10 запросов всё равно ждут по 100 мс.
+
+### Проблема: точность
+
+`time.Second / time.Duration(rps)` — при больших RPS может дать **0**.
+
+```go
+rps := 1_000_000
+interval := time.Second / time.Duration(rps)  // = 1000 наносекунд
+```
+
+**Но:** `time.NewTicker` имеет разрешение ~1 мс. Для высоких RPS — **неточно**.
+
+### 💡 Практика: как использовать time.Ticker
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`time.NewTicker`**, не `time.Tick`.
+2. **`defer ticker.Stop()`.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Простые случаи, без burst.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не используй `time.Tick` в production.**
+5. **Не жди burst от `time.Ticker`.**
+
+---
+
+## 14.3 Token bucket с нуля
+
+Token bucket решает проблемы `time.Ticker`: burst, точность, остановка.
+
+### Идея
+
+**Ведро с токенами:**
+
+- Токены **добавляются** со скоростью `rate` (токенов/сек).
+- Ведро **вмещает** максимум `burst` токенов.
+- Каждый запрос **забирает** 1 токен.
+- Если токенов нет — запрос **ждёт**.
+
+### Схема
+
+```
+┌─────────────────────────────────────┐
+│         Token Bucket                │
+│                                     │
+│  ┌─────────────────────────────┐    │
+│  │  🪙 🪙 🪙 🪙 🪙              │    │  ← ведро (burst=5)
+│  └─────────────────────────────┘    │
+│         ▲                  │        │
+│         │                  │        │
+│    добавление          забор токена │
+│    (rate/сек)          (запрос)     │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+**Что происходит:**
+
+1. Каждые `1/rate` секунд добавляется токен.
+2. Если ведро полно (`burst` токенов) — токен **пропускается**.
+3. Запрос забирает токен.
+4. Если токенов нет — запрос **блокируется**.
+
+### Реализация на каналах
+
+**Канал как ведро:**
+
+- **Буфер канала** = `burst` (размер ведра).
+- **Элементы** = токены.
+- **Забор токена** = чтение из канала.
+- **Добавление токена** = запись в канал.
+
+```go
+func tokenBucket(rps int, burst int) (chan struct{}, func()) {
+    tokens := make(chan struct{}, burst)
+    stop := make(chan struct{})
+    
+    // Наполняем ведро начальными токенами
+    for i := 0; i < burst; i++ {
+        tokens <- struct{}{}
+    }
+    
+    // Добавляем токены со скоростью rps
+    go func() {
+        interval := time.Second / time.Duration(rps)
+        ticker := time.NewTicker(interval)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-stop:
+                return
+            case <-ticker.C:
+                select {
+                case tokens <- struct{}{}:
+                default:  // ведро полно — пропускаем
+                }
+            }
+        }
+    }()
+    
+    return tokens, func() { close(stop) }
+}
+```
+
+**Разберём по шагам.**
+
+### Шаг 1: создание ведра
+
+```go
+tokens := make(chan struct{}, burst)
+```
+
+**Что делает:** буферизованный канал на `burst` элементов — «ведро с токенами».
+
+### Шаг 2: начальное заполнение
+
+```go
+for i := 0; i < burst; i++ {
+    tokens <- struct{}{}
+}
+```
+
+**Что делает:** заполняет ведро `burst` токенами. **Burst — можно забрать сразу.**
+
+### Шаг 3: горутина-наполнитель
+
+```go
+go func() {
+    interval := time.Second / time.Duration(rps)
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-stop:
+            return
+        case <-ticker.C:
+            select {
+            case tokens <- struct{}{}:
+            default:
+            }
+        }
+    }
+}()
+```
+
+**Что делает:**
+
+- Каждые `interval` секунд добавляет токен.
+- Если ведро полно — токен **пропускается** (не блокируется).
+- Останавливается по `stop`.
+
+### Шаг 4: забор токена
+
+```go
+<-tokens
+```
+
+**Что делает:** забирает токен из ведра. Если пусто — блокируется.
+
+### Шаг 5: полный пример
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func tokenBucket(rps int, burst int) (chan struct{}, func()) {
+    tokens := make(chan struct{}, burst)
+    stop := make(chan struct{})
+    
+    for i := 0; i < burst; i++ {
+        tokens <- struct{}{}
+    }
+    
+    go func() {
+        interval := time.Second / time.Duration(rps)
+        ticker := time.NewTicker(interval)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-stop:
+                return
+            case <-ticker.C:
+                select {
+                case tokens <- struct{}{}:
+                default:
+                }
+            }
+        }
+    }()
+    
+    return tokens, func() { close(stop) }
+}
+
+func main() {
+    tokens, stop := tokenBucket(10, 5)  // 10/сек, burst 5
+    defer stop()
+    
+    start := time.Now()
+    for i := 0; i < 20; i++ {
+        <-tokens
+        fmt.Printf("[%v] request %d\n", time.Since(start).Round(time.Millisecond), i)
+    }
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] request 0
+[0s] request 1
+[0s] request 2
+[0s] request 3
+[0s] request 4
+[100ms] request 5
+[200ms] request 6
+[300ms] request 7
+...
+```
+
+**Что видно:**
+
+- Первые 5 запросов — **мгновенно** (burst).
+- Каждый следующий — с интервалом 100 мс (10/сек).
+
+### Схема
+
+```
+Ведро (burst=5):
+  [🪙][🪙][🪙][🪙][🪙]  ← начальное заполнение
+
+Наполнитель каждые 100 мс:
+  tokens <- {}  ← если есть место
+
+Потребитель:
+  <-tokens  ← забирает токен, блокируется, если пусто
+```
+
+### Ограничения реализации
+
+**1. Точность при высоких rps.**
+
+`time.Second / time.Duration(rps)` при `rps = 1 000 000` даст 1000 наносекунд. Но `time.NewTicker` имеет разрешение ~1 мс. Для высоких rps — **неточно**.
+
+**2. Нет `WaitN`.**
+
+Нельзя забрать N токенов за раз.
+
+**3. Нет `Allow`.**
+
+Нельзя проверить без блокировки.
+
+**4. Нет `Reserve`.**
+
+Нельзя запланировать на будущее.
+
+**Для production** используй `golang.org/x/time/rate`.
+
+### 💡 Практика: как писать token bucket
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Буферизованный канал = ведро.**
+2. **Наполнитель через `time.NewTicker`.**
+3. **`select` с `default` при добавлении токена.**
+4. **`stop` канал для остановки.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+5. **Оформляй в структуру.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не используй в production** — `x/time/rate` лучше.
+7. **Не забывай `stop`.**
+
+---
+
+## 14.4 Burst: зачем нужен
+
+**Burst** — максимальное число токенов в ведре. Позволяет накопить «запас» и потратить его сразу.
+
+### Без burst
+
+**Burst = 1:** каждую секунду ровно 1 запрос. Строгое ограничение.
+
+```
+t=0:  запрос 0  ──► 1 сек ждём
+t=1s: запрос 1  ──► 1 сек ждём
+t=2s: запрос 2
+...
+```
+
+**Проблема:** если первый запрос нужен **сразу**, а следующий — через час, всё равно ждёшь секунду. Burst = 1 **не разрешает пики**.
+
+### С burst = 10
+
+**Что происходит:**
+
+- Ведро на 10 токенов.
+- Изначально 10 токенов.
+- Первые 10 запросов — **мгновенно**.
+- Дальше — 1 в секунду.
+
+```
+t=0:    запросы 0-9  ──► мгновенно (10 токенов)
+t=1s:   запрос 10    ──► 1 токен добавлен
+t=2s:   запрос 11
+...
+```
+
+**Burst разрешает пики.** Если иногда нужно 10 запросов подряд — burst = 10.
+
+### Аналогия: запас воды
+
+**Burst = 1:** стакан воды. Наливаешь, пьёшь, ждёшь следующую каплю.
+
+**Burst = 10:** ведро воды. Первые 10 глотков — сразу. Дальше — по капле.
+
+### Размер burst
+
+**Маленький (1–5):**
+
+- Строгое ограничение.
+- Нет пиков.
+
+**Средний (10–100):**
+
+- Для большинства случаев.
+- Небольшие пики.
+
+**Большой (1000+):**
+
+- Почти не ограничивает.
+- Большие пики.
+
+**Правило:** burst = максимум **одновременных** запросов, которые сервис может выдержать.
+
+### Пример: API с лимитом 100/сек
+
+**Burst = 1:**
+
+```go
+limiter := rate.NewLimiter(100, 1)
+```
+
+- 100 запросов/сек.
+- Строго по одному.
+
+**Burst = 10:**
+
+```go
+limiter := rate.NewLimiter(100, 10)
+```
+
+- 100 запросов/сек.
+- Первые 10 — мгновенно.
+- Дальше по 10 мс.
+
+**Burst = 100:**
+
+```go
+limiter := rate.NewLimiter(100, 100)
+```
+
+- 100 запросов/сек.
+- Первые 100 — мгновенно.
+
+### Что выбрать
+
+| Сценарий | Burst |
+|:---|:---|
+| Строгий лимит | 1–5 |
+| Обычный API | 10–100 |
+| Большие пики | 100–1000 |
+| Не ограничивать | 10 000+ |
+
+### 💡 Практика: как настраивать burst
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Burst = максимум одновременных запросов.**
+2. **Burst 10–100** для большинства API.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Мониторь отклонённые запросы** — если много, увеличить burst.
+4. **Мониторь rate limit errors** от внешнего API.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не ставь burst 1** для всех случаев.
+6. **Не ставь burst 10 000** без причины.
+
+---
+
+## 14.5 golang.org/x/time/rate
+
+Для production — используй `golang.org/x/time/rate`. Это **production-ready** rate limiter.
+
+### Установка
+
+```bash
+go get golang.org/x/time/rate
+```
+
+### Создание
+
+```go
+import "golang.org/x/time/rate"
+
+limiter := rate.NewLimiter(rate.Limit(100), 10)  // 100/сек, burst 10
+```
+
+**Параметры:**
+
+- **`rate.Limit(100)`** — скорость: 100/сек.
+- **`10`** — burst.
+
+### Три метода
+
+**`Wait(ctx)`** — блокирующее ожидание разрешения.
+
+```go
+if err := limiter.Wait(ctx); err != nil {
+    return err  // ctx отменён
+}
+// разрешение получено
+```
+
+**`Allow()`** — неблокирующая проверка.
+
+```go
+if limiter.Allow() {
+    // разрешено
+} else {
+    // отклонено
+}
+```
+
+**`Reserve()`** — резервирование с задержкой.
+
+```go
+r := limiter.Reserve()
+if !r.OK() {
+    return
+}
+delay := r.Delay()
+time.Sleep(delay)
+```
+
+### Полный пример
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+    
+    "golang.org/x/time/rate"
+)
+
+func main() {
+    limiter := rate.NewLimiter(rate.Limit(10), 5)  // 10/сек, burst 5
+    ctx := context.Background()
+    
+    start := time.Now()
+    for i := 0; i < 20; i++ {
+        if err := limiter.Wait(ctx); err != nil {
+            fmt.Println("wait failed:", err)
+            return
+        }
+        fmt.Printf("[%v] request %d\n", time.Since(start).Round(time.Millisecond), i)
+    }
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] request 0
+[0s] request 1
+[0s] request 2
+[0s] request 3
+[0s] request 4
+[100ms] request 5
+[200ms] request 6
+...
+```
+
+### HTTP-клиент с rate limiter
+
+```go
+type RateLimitedClient struct {
+    client  *http.Client
+    limiter *rate.Limiter
+}
+
+func NewRateLimitedClient(rps int, burst int) *RateLimitedClient {
+    return &RateLimitedClient{
+        client:  &http.Client{Timeout: 10 * time.Second},
+        limiter: rate.NewLimiter(rate.Limit(rps), burst),
+    }
+}
+
+func (c *RateLimitedClient) Get(ctx context.Context, url string) (*http.Response, error) {
+    if err := c.limiter.Wait(ctx); err != nil {
+        return nil, err
+    }
+    
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+    return c.client.Do(req)
+}
+```
+
+**Что происходит:** каждый запрос ждёт разрешения лимитера.
+
+### Сравнение с нашей реализацией
+
+| Аспект | Наш token bucket | `x/time/rate` |
+|:---|:---|:---|
+| Burst | ✅ | ✅ |
+| `context` | Частично | ✅ |
+| `Allow()` | ❌ | ✅ |
+| `WaitN()` | ❌ | ✅ |
+| `Reserve()` | ❌ | ✅ |
+| Точность при высоких rps | Ограничена | Высокая |
+| Production-ready | ❌ | ✅ |
+
+**Вывод:** наш token bucket — для **понимания**. Для production — `x/time/rate`.
+
+### 💡 Практика: как использовать x/time/rate
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`rate.NewLimiter(rate.Limit(rps), burst)`.**
+2. **`limiter.Wait(ctx)`** перед операцией.
+3. **`Allow()`** для неблокирующей проверки.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Оформляй в структуру.**
+5. **Мониторь отклонённые запросы.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не используй свой rate limiter в production.**
+7. **Не забывай `context`.**
+
+---
+
+## 14.6 Rate limiter с context
+
+`context` — критичен для rate limiter. Без него `Wait` может **блокироваться навсегда**.
+
+### Проблема
+
+```go
+limiter.Wait(ctx)  // ← что если ctx отменён?
+```
+
+**С `x/time/rate`:** `Wait(ctx)` **проверяет ctx**. Если отменён — возвращает ошибку.
+
+**С нашим token bucket:** `<-tokens` **не проверяет ctx**. Может блокироваться навсегда.
+
+### Решение для нашего token bucket
+
+```go
+func waitToken(ctx context.Context, tokens <-chan struct{}) error {
+    select {
+    case <-tokens:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+```
+
+**Что происходит:** `select` с `ctx.Done()`.
+
+### Полный пример
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func tokenBucket(rps int, burst int) (chan struct{}, func()) {
+    tokens := make(chan struct{}, burst)
+    stop := make(chan struct{})
+    
+    for i := 0; i < burst; i++ {
+        tokens <- struct{}{}
+    }
+    
+    go func() {
+        interval := time.Second / time.Duration(rps)
+        ticker := time.NewTicker(interval)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-stop:
+                return
+            case <-ticker.C:
+                select {
+                case tokens <- struct{}{}:
+                default:
+                }
+            }
+        }
+    }()
+    
+    return tokens, func() { close(stop) }
+}
+
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+    defer cancel()
+    
+    tokens, stop := tokenBucket(10, 5)
+    defer stop()
+    
+    start := time.Now()
+    for i := 0; i < 20; i++ {
+        select {
+        case <-tokens:
+            fmt.Printf("[%v] request %d\n", time.Since(start).Round(time.Millisecond), i)
+        case <-ctx.Done():
+            fmt.Println("timeout:", ctx.Err())
+            return
+        }
+    }
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] request 0
+[0s] request 1
+[0s] request 2
+[0s] request 3
+[0s] request 4
+[100ms] request 5
+[200ms] request 6
+timeout: context deadline exceeded
+```
+
+**Что происходит:** через 250 мс `ctx` отменяется, цикл завершается.
+
+### Rate limiter + worker pool + context
+
+```go
+func worker(ctx context.Context, tasksCh <-chan Task, limiter *rate.Limiter) {
     for {
         select {
         case <-ctx.Done():
             return
-        default:
-        }
-
-        msg, err := c.consumer.Read(ctx)
-        if err != nil {
-            if errors.Is(err, context.Canceled) {
+        case task, ok := <-tasksCh:
+            if !ok {
                 return
             }
-            slog.Error("read error", "error", err)
-            time.Sleep(100 * time.Millisecond)
-            continue
-        }
-
-        select {
-        case out <- msg:
-            c.metrics.Read.Add(1)
-        case <-ctx.Done():
-            return
-        }
-    }
-}
-```
-
-### Шаг 4: worker
-
-```go
-func (c *Consumer) worker(ctx context.Context, in <-chan Message) {
-    batch := make([]Message, 0, c.batchSize)
-
-    commit := func() {
-        if len(batch) == 0 {
-            return
-        }
-        if err := c.consumer.Commit(ctx, batch); err != nil {
-            slog.Error("commit error", "error", err, "batch_size", len(batch))
-        }
-        batch = batch[:0]
-    }
-    defer commit()
-
-    for msg := range in {
-        if err := c.process(ctx, msg); err != nil {
-            c.metrics.Failed.Add(1)
-            slog.Error("process error", "error", err, "msg_id", msg.ID)
-
-            if isPermanent(err) {
-                c.sendToDLQ(ctx, msg)
-                batch = append(batch, msg)  // коммитим, чтобы не зацикливаться
+            if err := limiter.Wait(ctx); err != nil {
+                return  // ctx отменён
             }
-            // временные ошибки — не коммитим, будет retry
-            continue
-        }
-
-        c.metrics.Processed.Add(1)
-        batch = append(batch, msg)
-
-        if len(batch) >= c.batchSize {
-            commit()
+            process(task)
         }
     }
 }
 ```
 
-### Шаг 5: обработка
+**Что происходит:** worker pool + rate limiter + context.
 
-```go
-func (c *Consumer) process(ctx context.Context, msg Message) error {
-    // Обработка с таймаутом
-    processCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-    defer cancel()
-
-    return doProcess(processCtx, msg)
-}
-
-func isPermanent(err error) bool {
-    var permErr *PermanentError
-    return errors.As(err, &permErr)
-}
-
-func (c *Consumer) sendToDLQ(ctx context.Context, msg Message) {
-    // Отправка в dead letter queue
-    slog.Warn("sending to DLQ", "msg_id", msg.ID)
-}
-```
-
-### Шаг 6: main
-
-```go
-func main() {
-    ctx, stop := signal.NotifyContext(context.Background(),
-        syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    consumer := NewConsumer(kafkaConsumer, 10, 100)
-
-    if err := consumer.Run(ctx); err != nil {
-        slog.Error("run failed", "error", err)
-        os.Exit(1)
-    }
-}
-```
-
-### Что демонстрирует
-
-1. **Worker pool** — 10 воркеров.
-2. **Batch commit** — коммит каждые 100 сообщений.
-3. **Graceful drain** — при сигнале.
-4. **Retry** — временные ошибки.
-5. **DLQ** — постоянные ошибки.
-6. **Метрики** — сколько обработано.
-
-### Аннотация сложности
-
-| Компонент | Time | Space |
-|:---|:---|:---|
-| Read | ~1-10 мс | 0 |
-| Process | зависит | зависит |
-| Batch commit | ~10-100 мс | 0 |
-| Drain | 0-30 сек | 0 |
-
-### 💡 Практика: как строить consumer
+### 💡 Практика: как добавить context
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Worker pool** — N воркеров.
-2. **Batch commit** — для производительности.
-3. **Graceful drain** — при сигнале.
-4. **Retry** — для временных ошибок.
-5. **DLQ** — для постоянных.
+1. **`select` с `ctx.Done()`** при ожидании токена.
+2. **`Wait(ctx)`** в `x/time/rate`.
+3. **Проверяй `ctx.Err()`.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-6. **Метрики** — read, processed, failed.
-7. **Таймауты** на обработку.
+4. **`ctx` — первый аргумент.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-8. **Не коммить до обработки.**
-9. **Не зацикливайся на плохих сообщениях.**
-10. **Не забывай drain.**
-
-### Ключевые выводы подглавы 14.2
-
-- **Worker pool** — для параллелизма.
-- **Batch commit** — производительность.
-- **Graceful drain** — при сигнале.
-- **Retry + DLQ** — для ошибок.
-- **Метрики** — обязательны.
+5. **Не блокируйся на `<-tokens` без `ctx`.**
+6. **Не забывай `ctx`.**
 
 ---
 
-## 14.3 ETL-пайплайн с batch и backpressure
+## 14.7 В связке с другими паттернами
 
-Построим **ETL-пайплайн**.
+Rate limiter редко используется **в одиночку**. Разберём связки.
 
-### Требования
+### Worker pool + rate limiter
 
-1. **Source** — читает данные.
-2. **Transform** — обрабатывает.
-3. **Load** — пишет.
-4. **Batch** — группирует.
-5. **Backpressure** — между стадиями.
-6. **Метрики** — на каждой стадии.
-
-### Шаг 1: структура
+**Классическая связка:** worker pool ограничивает параллелизм, rate limiter — скорость.
 
 ```go
-type Pipeline struct {
-    source    Source
-    transform Transformer
-    sink      Sink
-    batchSize int
-    metrics   *Metrics
-}
-
-type Source interface {
-    Read(ctx context.Context) (Record, error)
-    Close() error
-}
-
-type Transformer interface {
-    Transform(ctx context.Context, rec Record) (Record, error)
-}
-
-type Sink interface {
-    WriteBatch(ctx context.Context, batch []Record) error
-    Close() error
-}
-```
-
-### Шаг 2: стадия Source
-
-```go
-func (p *Pipeline) source(ctx context.Context) <-chan Record {
-    out := make(chan Record, 100)
-
-    go func() {
-        defer close(out)
-        for {
-            rec, err := p.source.Read(ctx)
-            if err != nil {
-                if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+func workerPoolWithRateLimit(ctx context.Context, tasks []Task, numWorkers int, limiter *rate.Limiter) {
+    tasksCh := make(chan Task, len(tasks))
+    
+    var wg sync.WaitGroup
+    for i := 0; i < numWorkers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for {
+                select {
+                case <-ctx.Done():
                     return
+                case task, ok := <-tasksCh:
+                    if !ok {
+                        return
+                    }
+                    if err := limiter.Wait(ctx); err != nil {
+                        return
+                    }
+                    process(task)
                 }
-                slog.Error("source read error", "error", err)
-                continue
             }
-
-            select {
-            case out <- rec:
-                p.metrics.SourceCount.Add(1)
-            case <-ctx.Done():
-                return
-            }
+        }()
+    }
+    
+    for _, task := range tasks {
+        select {
+        case tasksCh <- task:
+        case <-ctx.Done():
+            close(tasksCh)
+            wg.Wait()
+            return
         }
-    }()
-
-    return out
+    }
+    close(tasksCh)
+    wg.Wait()
 }
 ```
 
-### Шаг 3: стадия Transform (fan-out)
+**Что даёт:** одновременно не более N воркеров, и не более RPS запросов/сек.
+
+### Pipeline + rate limiter
+
+**Rate limiter на стадии pipeline:**
 
 ```go
-func (p *Pipeline) transform(ctx context.Context, in <-chan Record, workers int) <-chan Record {
-    out := make(chan Record, 100)
-
+func enrichStage(ctx context.Context, input <-chan Parsed, workers int, limiter *rate.Limiter) <-chan Enriched {
+    out := make(chan Enriched)
+    
     var wg sync.WaitGroup
     for i := 0; i < workers; i++ {
         wg.Add(1)
         go func() {
             defer wg.Done()
-            for rec := range in {
-                transformed, err := p.transformOne(ctx, rec)
-                if err != nil {
-                    p.metrics.TransformFailed.Add(1)
-                    continue
+            for v := range input {
+                if err := limiter.Wait(ctx); err != nil {
+                    return
                 }
-
+                enriched := enrich(v)
                 select {
-                case out <- transformed:
-                    p.metrics.TransformCount.Add(1)
+                case out <- enriched:
                 case <-ctx.Done():
                     return
                 }
             }
         }()
     }
-
+    
     go func() {
         wg.Wait()
         close(out)
     }()
-
+    
     return out
 }
-
-func (p *Pipeline) transformOne(ctx context.Context, rec Record) (Record, error) {
-    transformCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-    defer cancel()
-    return p.transform.Transform(transformCtx, rec)
-}
 ```
 
-### Шаг 4: стадия Sink (batch)
+### HTTP-клиент + rate limiter + circuit breaker
+
+**Полная защита внешнего API:**
 
 ```go
-func (p *Pipeline) sink(ctx context.Context, in <-chan Record) error {
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
-
-    batch := make([]Record, 0, p.batchSize)
-
-    flush := func() error {
-        if len(batch) == 0 {
-            return nil
-        }
-        if err := p.sink.WriteBatch(ctx, batch); err != nil {
-            p.metrics.SinkFailed.Add(int64(len(batch)))
-            return err
-        }
-        p.metrics.SinkCount.Add(int64(len(batch)))
-        batch = batch[:0]
-        return nil
-    }
-
-    for {
-        select {
-        case <-ctx.Done():
-            return flush()
-        case <-ticker.C:
-            if err := flush(); err != nil {
-                slog.Error("flush error", "error", err)
-            }
-        case rec, ok := <-in:
-            if !ok {
-                return flush()
-            }
-            batch = append(batch, rec)
-            if len(batch) >= p.batchSize {
-                if err := flush(); err != nil {
-                    slog.Error("flush error", "error", err)
-                }
-            }
-        }
-    }
+type HTTPClient struct {
+    client  *http.Client
+    limiter *rate.Limiter
+    breaker *gobreaker.CircuitBreaker
 }
-```
 
-### Шаг 5: сборка
-
-```go
-func (p *Pipeline) Run(ctx context.Context) error {
-    sourceCh := p.source(ctx)
-    transformCh := p.transform(ctx, sourceCh, 10)
-
-    if err := p.sink(ctx, transformCh); err != nil {
-        return err
-    }
-
-    p.source.Close()
-    p.sink.Close()
-    return nil
-}
-```
-
-### Шаг 6: main
-
-```go
-func main() {
-    ctx, stop := signal.NotifyContext(context.Background(),
-        syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    pipeline := NewPipeline(source, transformer, sink, 1000)
-
-    if err := pipeline.Run(ctx); err != nil {
-        slog.Error("run failed", "error", err)
-        os.Exit(1)
-    }
-}
-```
-
-### Что демонстрирует
-
-1. **Pipeline** — source → transform → sink.
-2. **Fan-out** — 10 воркеров на transform.
-3. **Batch** — 1000 записей или 1 секунда.
-4. **Backpressure** — через буферизованные каналы.
-5. **Graceful shutdown** — flush при сигнале.
-6. **Метрики** — на каждой стадии.
-
-### Аннотация сложности
-
-| Стадия | Time | Space |
-|:---|:---|:---|
-| Source | ~1-10 мс | 0 |
-| Transform | ~1-10 мс × 10 | 0 |
-| Sink batch | ~10-100 мс | ~1000 записей |
-
-### 💡 Практика: как строить ETL
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Pipeline** — source → transform → sink.
-2. **Fan-out** для медленных стадий.
-3. **Batch** для sink.
-4. **Backpressure** — буфер 100-1000.
-5. **Graceful shutdown** — flush.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-6. **Метрики** на каждой стадии.
-7. **Таймауты** на transform.
-
-**❌ НЕ ДЕЛАЙ:**
-
-8. **Не забывай flush при shutdown.**
-9. **Не делай большие буферы.**
-10. **Не игнорируй ошибки transform.**
-
-### Ключевые выводы подглавы 14.3
-
-- **Pipeline** — source → transform → sink.
-- **Fan-out** — для transform.
-- **Batch** — для sink.
-- **Backpressure** — через каналы.
-- **Graceful shutdown** — flush.
-
----
-
-## 14.4 Scraper с rate limiter и circuit breaker
-
-Построим **scraper** для внешних источников.
-
-### Требования
-
-1. **Rate limiter** — не превышать лимиты.
-2. **Circuit breaker** — защита от сбоев.
-3. **Retry** — временные ошибки.
-4. **Concurrency limit** — не более N одновременных.
-5. **Graceful shutdown.**
-6. **Метрики.**
-
-### Шаг 1: структура
-
-```go
-type Scraper struct {
-    client   *http.Client
-    limiter  *rate.Limiter
-    breaker  *gobreaker.CircuitBreaker
-    sem      chan struct{}
-    workers  int
-    metrics  *Metrics
-}
-```
-
-### Шаг 2: создание
-
-```go
-func NewScraper(workers, rps, maxConcurrent int) *Scraper {
-    return &Scraper{
-        client: &http.Client{Timeout: 10 * time.Second},
-        limiter: rate.NewLimiter(rate.Limit(rps), rps*2),
-        breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
-            Name:        "scraper",
-            MaxRequests: 3,
-            Interval:    10 * time.Second,
-            Timeout:     30 * time.Second,
-            ReadyToTrip: func(counts gobreaker.Counts) bool {
-                return counts.ConsecutiveFailures > 5
-            },
-        }),
-        sem:     make(chan struct{}, maxConcurrent),
-        workers: workers,
-    }
-}
-```
-
-### Шаг 3: fetch
-
-```go
-func (s *Scraper) fetch(ctx context.Context, url string) ([]byte, error) {
+func (c *HTTPClient) Get(ctx context.Context, url string) (*http.Response, error) {
     // 1. Rate limiter
-    if err := s.limiter.Wait(ctx); err != nil {
+    if err := c.limiter.Wait(ctx); err != nil {
         return nil, err
     }
-
+    
     // 2. Circuit breaker
-    body, err := s.breaker.Execute(func() (interface{}, error) {
-        // 3. Semaphore
-        select {
-        case s.sem <- struct{}{}:
-            defer func() { <-s.sem }()
-        case <-ctx.Done():
-            return nil, ctx.Err()
-        }
-
-        // 4. HTTP
+    var resp *http.Response
+    _, err := c.breaker.Execute(func() (interface{}, error) {
         req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
         if err != nil {
             return nil, err
         }
-        resp, err := s.client.Do(req)
-        if err != nil {
-            return nil, err
-        }
-        defer resp.Body.Close()
-
-        if resp.StatusCode >= 500 {
-            return nil, fmt.Errorf("server error: %d", resp.StatusCode)
-        }
-        if resp.StatusCode >= 400 {
-            return nil, &PermanentError{Code: resp.StatusCode}
-        }
-
-        return io.ReadAll(resp.Body)
+        resp, err = c.client.Do(req)
+        return resp, err
     })
     if err != nil {
         return nil, err
     }
-
-    return body.([]byte), nil
+    return resp, nil
 }
 ```
 
-### Шаг 4: run
+**Что даёт:**
+
+- Rate limiter — ограничивает скорость.
+- Circuit breaker — защищает от сбоев.
+- HTTP — сам запрос.
+
+### Rate limiter + semaphore
+
+**Rate limiter + semaphore = скорость + параллелизм:**
 
 ```go
-func (s *Scraper) Run(ctx context.Context, urls []string) error {
-    urlCh := make(chan string, len(urls))
-    for _, url := range urls {
-        urlCh <- url
-    }
-    close(urlCh)
-
+func fetchAll(ctx context.Context, urls []string, maxConcurrent int, rps int) {
+    sem := make(chan struct{}, maxConcurrent)
+    limiter := rate.NewLimiter(rate.Limit(rps), rps*2)
+    
     var wg sync.WaitGroup
-    for i := 0; i < s.workers; i++ {
+    for _, url := range urls {
+        url := url
+        
+        // Semaphore
+        select {
+        case sem <- struct{}{}:
+        case <-ctx.Done():
+            wg.Wait()
+            return
+        }
+        
+        // Rate limiter
+        if err := limiter.Wait(ctx); err != nil {
+            <-sem
+            wg.Wait()
+            return
+        }
+        
         wg.Add(1)
         go func() {
             defer wg.Done()
-            s.worker(ctx, urlCh)
+            defer func() { <-sem }()
+            http.Get(url)
         }()
     }
-
     wg.Wait()
-    return ctx.Err()
+}
+```
+
+### Схема: полная защита
+
+```
+Запрос
+   │
+   ▼
+┌──────────────┐
+│ Rate limiter │  ← не более RPS
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Semaphore  │  ← не более N одновременно
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Circuit    │  ← защита от сбоев
+│   breaker    │
+└──────┬───────┘
+       │
+       ▼
+     HTTP
+```
+
+### 💡 Практика: как комбинировать rate limiter
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Worker pool + rate limiter** — параллелизм + скорость.
+2. **Pipeline + rate limiter** — стадия с ограничением.
+3. **Rate limiter + circuit breaker** — защита API.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Rate limiter + semaphore** — для гибкости.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не забывай `context`.**
+
+---
+
+## 14.8 Практика Go: rate limiter с метриками
+
+Разберём **rate limiter с метриками**.
+
+### Полный код
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "sync/atomic"
+    "time"
+    
+    "golang.org/x/time/rate"
+)
+
+type Metrics struct {
+    Allowed atomic.Int64
+    Waited  atomic.Int64
+    Denied  atomic.Int64
 }
 
-func (s *Scraper) worker(ctx context.Context, urlCh <-chan string) {
-    for url := range urlCh {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-        }
-
-        body, err := s.retry(ctx, url)
-        if err != nil {
-            s.metrics.Failed.Add(1)
-            slog.Error("fetch error", "url", url, "error", err)
+func main() {
+    limiter := rate.NewLimiter(rate.Limit(100), 10)
+    var metrics Metrics
+    ctx := context.Background()
+    
+    // Симулируем 1000 запросов
+    start := time.Now()
+    for i := 0; i < 1000; i++ {
+        waitStart := time.Now()
+        if err := limiter.Wait(ctx); err != nil {
+            metrics.Denied.Add(1)
             continue
         }
-
-        s.metrics.Success.Add(1)
-        s.process(ctx, url, body)
+        waitDuration := time.Since(waitStart)
+        if waitDuration > time.Millisecond {
+            metrics.Waited.Add(1)
+        }
+        metrics.Allowed.Add(1)
     }
-}
-```
-
-### Шаг 5: retry
-
-```go
-func (s *Scraper) retry(ctx context.Context, url string) ([]byte, error) {
-    const maxAttempts = 3
-
-    var lastErr error
-    for attempt := 1; attempt <= maxAttempts; attempt++ {
-        body, err := s.fetch(ctx, url)
-        if err == nil {
-            return body, nil
-        }
-
-        var permErr *PermanentError
-        if errors.As(err, &permErr) {
-            return nil, err  // не retry
-        }
-
-        if errors.Is(err, gobreaker.ErrOpenState) {
-            return nil, err  // circuit open
-        }
-
-        lastErr = err
-
-        if attempt < maxAttempts {
-            backoff := time.Duration(attempt) * 100 * time.Millisecond
-            select {
-            case <-ctx.Done():
-                return nil, ctx.Err()
-            case <-time.After(backoff):
-            }
-        }
-    }
-
-    return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
-}
-```
-
-### Шаг 6: main
-
-```go
-func main() {
-    ctx, stop := signal.NotifyContext(context.Background(),
-        syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    scraper := NewScraper(10, 100, 20)
-
-    urls := loadURLs()
-    if err := scraper.Run(ctx, urls); err != nil && !errors.Is(err, context.Canceled) {
-        slog.Error("run failed", "error", err)
-        os.Exit(1)
-    }
-}
-```
-
-### Что демонстрирует
-
-1. **Rate limiter** — 100 запросов/сек.
-2. **Circuit breaker** — защита от сбоев.
-3. **Semaphore** — не более 20 одновременных.
-4. **Retry** — 3 попытки с backoff.
-5. **PermanentError** — не retry.
-6. **Graceful shutdown.**
-
-### Аннотация сложности
-
-| Компонент | Time |
-|:---|:---|
-| Rate limiter | ~50-100 нс |
-| Circuit breaker | ~100-200 нс |
-| Semaphore | ~30-70 нс |
-| HTTP | ~10-1000 мс |
-| Retry | × 3 |
-
-### 💡 Практика: как строить scraper
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Rate limiter** — первым.
-2. **Circuit breaker** — вторым.
-3. **Semaphore** — третьим.
-4. **Retry** — для временных ошибок.
-5. **PermanentError** — не retry.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-6. **Backoff** — между попытками.
-7. **Метрики** — success, failed.
-
-**❌ НЕ ДЕЛАЙ:**
-
-8. **Не retry на permanent ошибки.**
-9. **Не игнорируй circuit breaker.**
-10. **Не превышай rate limit.**
-
-### Ключевые выводы подглавы 14.4
-
-- **Порядок:** rate limiter → circuit breaker → semaphore.
-- **Retry** — с backoff.
-- **PermanentError** — не retry.
-- **Graceful shutdown.**
-
----
-
-## 14.5 Комбинированный сервис: всё вместе
-
-Соберём **всё вместе**.
-
-### Архитектура
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                       Service                                │
-│                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ HTTP Server  │───▶│   Kafka      │───▶│   ETL        │  │
-│  │ (requests)   │    │  Consumer    │    │  Pipeline    │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│         │                    │                    │         │
-│         ▼                    ▼                    ▼         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   Scraper    │    │  Worker Pool │    │   Batch      │  │
-│  │ (external)   │    │  (process)   │    │   Sink       │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                              │
-│  Всё работает с общим ctx                                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Структура
-
-```go
-type Service struct {
-    httpServer *http.Server
-    consumer   *Consumer
-    pipeline   *Pipeline
-    scraper    *Scraper
+    elapsed := time.Since(start)
     
-    shutdownTimeout time.Duration
+    fmt.Printf("Total:   %d\n", metrics.Allowed.Load()+metrics.Denied.Load())
+    fmt.Printf("Allowed: %d\n", metrics.Allowed.Load())
+    fmt.Printf("Denied:  %d\n", metrics.Denied.Load())
+    fmt.Printf("Waited:  %d\n", metrics.Waited.Load())
+    fmt.Printf("Elapsed: %v\n", elapsed)
+    fmt.Printf("Rate:    %.2f req/sec\n", float64(metrics.Allowed.Load())/elapsed.Seconds())
 }
 ```
 
-### Run
+**Пример вывода:**
 
-```go
-func (s *Service) Run(ctx context.Context) error {
-    g, ctx := errgroup.WithContext(ctx)
-
-    // HTTP-сервер
-    g.Go(func() error {
-        return s.runHTTP(ctx)
-    })
-
-    // Kafka consumer
-    g.Go(func() error {
-        return s.consumer.Run(ctx)
-    })
-
-    // ETL pipeline
-    g.Go(func() error {
-        return s.pipeline.Run(ctx)
-    })
-
-    // Scraper
-    g.Go(func() error {
-        return s.scraper.Run(ctx, s.urls)
-    })
-
-    return g.Wait()
-}
+```
+Total:   1000
+Allowed: 1000
+Denied:  0
+Waited:  995
+Elapsed: 9.95s
+Rate:    100.50 req/sec
 ```
 
-### main
+**Что видно:**
+
+- 1000 запросов за 9.95 сек.
+- Первые 10 (burst) — мгновенно.
+- Остальные — с интервалом 10 мс (100/сек).
+- Средняя скорость — 100.50 req/sec.
+
+### Пример: rate limiter в HTTP-клиенте
 
 ```go
-func main() {
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-    slog.SetDefault(logger)
+package main
 
-    ctx, stop := signal.NotifyContext(context.Background(),
-        syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "time"
+    
+    "golang.org/x/time/rate"
+)
 
-    svc := NewService(...)
+type Client struct {
+    http    *http.Client
+    limiter *rate.Limiter
+}
 
-    start := time.Now()
-    if err := svc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-        slog.Error("run failed", "error", err)
-        os.Exit(1)
+func NewClient(rps int, burst int) *Client {
+    return &Client{
+        http:    &http.Client{Timeout: 10 * time.Second},
+        limiter: rate.NewLimiter(rate.Limit(rps), burst),
     }
-    slog.Info("shutdown complete", "elapsed", time.Since(start))
 }
-```
 
-### Что демонстрирует
-
-1. **errgroup** — все компоненты с общим `ctx`.
-2. **Graceful shutdown** — при сигнале.
-3. **Комбинация** — HTTP + Kafka + ETL + Scraper.
-4. **Метрики** — на каждом компоненте.
-
-### Аннотация сложности
-
-| Компонент | Time |
-|:---|:---|
-| HTTP | зависит |
-| Kafka | зависит |
-| ETL | зависит |
-| Scraper | зависит |
-| Shutdown | 0-25 сек |
-
-### 💡 Практика: как комбинировать компоненты
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Общий `ctx`** — для graceful shutdown.
-2. **`errgroup`** — для запуска.
-3. **Метрики** на каждом компоненте.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Health checks** — `/healthz`, `/readyz`.
-5. **Tracing** — OpenTelemetry.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не забывай `ctx.Done()`** в компонентах.
-7. **Не игнорируй ошибки компонентов.**
-
-### Ключевые выводы подглавы 14.5
-
-- **errgroup** — для запуска компонентов.
-- **Общий `ctx`** — для graceful shutdown.
-- **Метрики** на каждом компоненте.
-- **Health checks** — обязательны.
-
----
-
-## 14.6 Диагностика production-проблем
-
-Разберём **диагностику** production.
-
-### Проблема 1: утечка горутин
-
-**Симптомы:**
-
-- `runtime.NumGoroutine` растёт.
-- Память растёт.
-- Через час — OOM.
-
-**Диагностика:**
-
-```bash
-curl http://localhost:6060/debug/pprof/goroutine?debug=2
-```
-
-**Что искать:**
-
-- Много горутин в `chan send`/`chan receive`.
-- Много горутин в `IO wait`.
-- Много горутин в `semacquire`.
-
-### Проблема 2: contention на мьютексе
-
-**Симптомы:**
-
-- CPU высокий, но throughput низкий.
-- Latency растёт.
-
-**Диагностика:**
-
-```go
-runtime.SetMutexProfileFraction(1)
-```
-
-```bash
-curl http://localhost:6060/debug/pprof/mutex
-go tool pprof mutex.prof
-```
-
-**Что искать:**
-
-- Функции с высоким contention.
-- `sync.(*Mutex).Lock` в top.
-
-### Проблема 3: backpressure не работает
-
-**Симптомы:**
-
-- Очередь растёт.
-- Память растёт.
-- Producer быстрее consumer.
-
-**Диагностика:**
-
-- Метрики длины очереди.
-- Метрики latency consumer.
-
-**Что делать:**
-
-- Увеличить число воркеров.
-- Уменьшить размер буфера.
-- Добавить rate limiter.
-
-### Проблема 4: медленный внешний сервис
-
-**Симптомы:**
-
-- Timeout ошибки.
-- Latency растёт.
-
-**Диагностика:**
-
-- Метрики latency по внешним вызовам.
-- Circuit breaker состояние.
-
-**Что делать:**
-
-- Circuit breaker.
-- Retry с backoff.
-- Timeout.
-
-### Проблема 5: deadlock
-
-**Симптомы:**
-
-- Сервис не отвечает.
-- CPU низкий.
-- Goroutine dump показывает горутины в `semacquire`.
-
-**Диагностика:**
-
-```bash
-kill -QUIT <pid>
-```
-
-**Что искать:**
-
-- Горутины в `semacquire` на одном мьютексе.
-- Горутины в `chan send`/`chan receive`.
-
-### Проблема 6: GC паузы
-
-**Симптомы:**
-
-- Latency spikes.
-- pprof показывает много GC.
-
-**Диагностика:**
-
-```bash
-GODEBUG=gctrace=1 ./app
-```
-
-**Что делать:**
-
-- Уменьшить аллокации.
-- `sync.Pool` для частых объектов.
-
-### Шаг: мониторинг
-
-**Обязательные метрики:**
-
-- **Goroutines:** `runtime.NumGoroutine()`.
-- **Memory:** `runtime.ReadMemStats`.
-- **GC:** паузы, частота.
-- **HTTP:** requests, latency, errors.
-- **Kafka:** lag, processed.
-- **Внешние сервисы:** latency, errors, circuit state.
-
-### Аннотация сложности
-
-| Проблема | Диагностика |
-|:---|:---|
-| Утечка горутин | pprof goroutine |
-| Contention | mutex profile |
-| Backpressure | метрики очереди |
-| Медленный сервис | метрики latency |
-| Deadlock | goroutine dump |
-| GC паузы | gctrace |
-
-### 💡 Практика: как диагностировать production
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **pprof в production (localhost).**
-2. **Метрики:** goroutines, memory, GC, HTTP, Kafka.
-3. **Circuit breaker состояние.**
-4. **Логи с контекстом.**
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-5. **Tracing** — OpenTelemetry.
-6. **Алерты** на метрики.
-
-**❌ НЕ ДЕЛАЙ:**
-
-7. **Не открывай pprof наружу.**
-8. **Не игнорируй рост горутин.**
-9. **Не забывай про circuit breaker.**
-
-### Ключевые выводы подглавы 14.6
-
-- **pprof** — для утечек, contention.
-- **Метрики** — для backpressure, latency.
-- **Goroutine dump** — для deadlock.
-- **gctrace** — для GC пауз.
-- **Мониторинг** — обязателен.
-
----
-
-## 14.7 Тестирование реальных сценариев
-
-Разберём **тестирование**.
-
-### HTTP-сервер
-
-```go
-func TestServer(t *testing.T) {
-    defer goleak.VerifyNone(t)
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    srv := NewServer(":0", 10, 100)
-
-    done := make(chan error, 1)
-    go func() {
-        done <- srv.Run(ctx)
-    }()
-
-    // Даём серверу запуститься
-    time.Sleep(100 * time.Millisecond)
-
-    // Тест запросов
-    resp, err := http.Get("http://localhost:8080/healthz")
+func (c *Client) Get(ctx context.Context, url string) (*http.Response, error) {
+    if err := c.limiter.Wait(ctx); err != nil {
+        return nil, err
+    }
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
     if err != nil {
-        t.Fatal(err)
+        return nil, err
     }
-    if resp.StatusCode != http.StatusOK {
-        t.Errorf("status = %d, want 200", resp.StatusCode)
-    }
-    resp.Body.Close()
+    return c.http.Do(req)
+}
 
-    cancel()
-
-    select {
-    case err := <-done:
+func main() {
+    client := NewClient(10, 5)
+    ctx := context.Background()
+    
+    start := time.Now()
+    for i := 0; i < 15; i++ {
+        resp, err := client.Get(ctx, "https://example.com")
         if err != nil {
-            t.Fatal(err)
+            fmt.Printf("[%v] error: %v\n", time.Since(start).Round(time.Millisecond), err)
+            continue
         }
-    case <-time.After(5 * time.Second):
-        t.Fatal("shutdown timeout")
+        resp.Body.Close()
+        fmt.Printf("[%v] request %d OK\n", time.Since(start).Round(time.Millisecond), i)
     }
 }
 ```
 
-### Consumer
+**Что демонстрирует:** HTTP-клиент с rate limiter. Не более 10 запросов/сек.
 
-```go
-type MockConsumer struct {
-    messages []Message
-    idx      int
-    mu       sync.Mutex
-}
-
-func (m *MockConsumer) Read(ctx context.Context) (Message, error) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    if m.idx >= len(m.messages) {
-        return Message{}, io.EOF
-    }
-    msg := m.messages[m.idx]
-    m.idx++
-    return msg, nil
-}
-
-func (m *MockConsumer) Commit(ctx context.Context, msgs []Message) error {
-    return nil
-}
-
-func (m *MockConsumer) Close() error {
-    return nil
-}
-
-func TestConsumer(t *testing.T) {
-    defer goleak.VerifyNone(t)
-
-    consumer := &MockConsumer{
-        messages: []Message{
-            {ID: "1", Body: []byte("a")},
-            {ID: "2", Body: []byte("b")},
-            {ID: "3", Body: []byte("c")},
-        },
-    }
-
-    c := NewConsumer(consumer, 2, 10)
-
-    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-    defer cancel()
-
-    if err := c.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-        t.Fatal(err)
-    }
-
-    // Проверяем, что все обработаны
-    if c.metrics.Processed.Load() != 3 {
-        t.Errorf("processed = %d, want 3", c.metrics.Processed.Load())
-    }
-}
-```
-
-### Scraper
-
-```go
-func TestScraper(t *testing.T) {
-    defer goleak.VerifyNone(t)
-
-    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("hello"))
-    }))
-    defer srv.Close()
-
-    scraper := NewScraper(5, 100, 10)
-
-    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    defer cancel()
-
-    urls := []string{srv.URL, srv.URL, srv.URL}
-    if err := scraper.Run(ctx, urls); err != nil && !errors.Is(err, context.Canceled) {
-        t.Fatal(err)
-    }
-
-    if scraper.metrics.Success.Load() != 3 {
-        t.Errorf("success = %d, want 3", scraper.metrics.Success.Load())
-    }
-}
-```
-
-### Stress-тесты
-
-```go
-func TestServerStress(t *testing.T) {
-    if testing.Short() {
-        t.Skip("skipping stress test")
-    }
-    defer goleak.VerifyNone(t)
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    srv := NewServer(":0", 100, 10000)
-
-    done := make(chan error, 1)
-    go func() {
-        done <- srv.Run(ctx)
-    }()
-
-    time.Sleep(100 * time.Millisecond)
-
-    // 1000 запросов параллельно
-    var wg sync.WaitGroup
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            resp, err := http.Get("http://localhost:8080/")
-            if err != nil {
-                return
-            }
-            resp.Body.Close()
-        }()
-    }
-    wg.Wait()
-
-    cancel()
-    <-done
-}
-```
-
-### Запуск
-
-```bash
-# Обычные тесты
-go test ./...
-
-# С race detector
-go test -race ./...
-
-# Stress
-go test -race -count=10 ./...
-
-# Short
-go test -short ./...
-
-# Бенчмарки
-go test -bench=. -benchmem ./...
-```
-
-### Аннотация сложности
-
-| Тест | Time |
-|:---|:---|
-| TestServer | ~500 мс |
-| TestConsumer | ~1 сек |
-| TestScraper | ~2 сек |
-| TestServerStress | ~5 сек |
-
-### 💡 Практика: как тестировать реальные сценарии
+### 💡 Практика: как измерять rate limiter
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **`goleak`** — для утечек.
-2. **`-race`** — для гонок.
-3. **Mock-интерфейсы** — для внешних сервисов.
-4. **Stress-тесты** — для нагрузки.
+1. **Метрики:** allowed, waited, denied.
+2. **Средняя скорость** — allowed / elapsed.
+3. **Burst size** — число мгновенных запросов.
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-5. **`testing.Short()`** — для skip.
-6. **`httptest`** — для HTTP.
+4. **Экспорт в Prometheus.**
+5. **Мониторинг rate limit errors** от внешнего API.
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не используй `time.Sleep` для синхронизации.**
-8. **Не забывай `-race`.**
-
-### Ключевые выводы подглавы 14.7
-
-- **`goleak`** — для утечек.
-- **`-race`** — для гонок.
-- **Mock-интерфейсы** — для внешних.
-- **Stress-тесты** — для нагрузки.
+6. **Не используй `Mutex` для метрик.**
+7. **Не игнорируй растущее число denied.**
 
 ---
 
-## 14.8 Выводы и типичные ошибки
+## 14.9 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-HTTP-сервер с ограничением параллелизма: семафор + rate limiter + graceful shutdown. Consumer: worker pool + batch commit + drain + retry + DLQ. ETL: pipeline + fan-out + batch + backpressure. Scraper: rate limiter → circuit breaker → semaphore + retry. Комбинированный сервис: errgroup + общий ctx. Диагностика: pprof, метрики, goroutine dump. Тестирование: goleak, -race, mock, stress.
+Rate limiter — примитив для ограничения **скорости** операций. **Простейший** — `time.Ticker` (но без burst). **Token bucket** — ведро с токенами: токены добавляются со скоростью `rate`, максимум `burst`. **Burst** — для пиков. **`golang.org/x/time/rate`** — production-ready. **`context`** — для отмены. Rate limiter комбинируется с worker pool, pipeline, circuit breaker, semaphore.
 
 **Типичные ошибки:**
 
-- ❌ **Не ограничивать параллелизм.** OOM.
-- ❌ **Не использовать rate limiter** для внешних.
-- ❌ **Не использовать circuit breaker.**
-- ❌ **Не делать drain** для очередей.
-- ❌ **Не коммить batch.**
-- ❌ **Не flush batch при shutdown.**
-- ❌ **Не использовать retry.**
-- ❌ **Retry на permanent ошибки.**
-- ❌ **Не логировать с контекстом.**
-- ❌ **Не мониторить goroutines.**
-- ❌ **Не использовать pprof.**
-- ❌ **Не тестировать graceful shutdown.**
-- ❌ **Не использовать goleak.**
-- ❌ **Не использовать -race.**
+- ❌ **Использовать `time.Tick` в production.** Утечка.
+- ❌ **Не использовать `time.NewTicker` + `Stop`.** Утечка.
+- ❌ **Забыть про burst.** Пики не пройдут.
+- ❌ **Burst = 1.** Нет пиков.
+- ❌ **Burst = 10 000.** Почти не ограничивает.
+- ❌ **Блокироваться на `<-tokens` без `ctx`.** Зависание.
+- ❌ **Не использовать `x/time/rate` в production.**
+- ❌ **Путать rate limiter с worker pool.**
+- ❌ **Не мониторить rate limit errors.**
 
 ---
 
-## 14.9 Для быстрого повторения
+## 14.10 Для быстрого повторения
 
-- **HTTP:** семафор + rate limiter + graceful shutdown.
-- **Consumer:** worker pool + batch commit + drain + retry + DLQ.
-- **ETL:** pipeline + fan-out + batch + backpressure.
-- **Scraper:** rate limiter → circuit breaker → semaphore + retry.
-- **Комбинированный:** errgroup + общий ctx.
-- **Диагностика:** pprof, метрики, goroutine dump.
-- **Тестирование:** goleak, -race, mock, stress.
-- **Health checks:** `/healthz`, `/readyz`.
-- **Метрики:** goroutines, memory, GC, HTTP, Kafka.
-- **Graceful shutdown:** 25 секунд.
-- **Retry:** 3 попытки с backoff.
-- **DLQ:** для permanent ошибок.
-
----
-
-## 14.10 Вопросы для самопроверки
-
-1. Как ограничить параллелизм в HTTP-сервере?
-2. Как защититься от DDoS?
-3. Как обработать Kafka с worker pool?
-4. Что такое batch commit?
-5. Что такое DLQ?
-6. Как построить ETL-пайплайн?
-7. Что такое backpressure в ETL?
-8. Как построить scraper?
-9. Почему rate limiter должен быть первым?
-10. Что такое circuit breaker?
-11. Как комбинировать компоненты в одном сервисе?
-12. Как диагностировать утечку горутин?
-13. Как диагностировать contention?
-14. Как диагностировать deadlock?
-15. Как тестировать HTTP-сервер?
-16. Как тестировать consumer?
-17. Как тестировать scraper?
-18. Какие метрики обязательны?
+- **Rate limiter** — ограничивает скорость (операций/сек).
+- **Worker pool** — параллелизм. **Semaphore** — параллелизм. **Rate limiter** — скорость.
+- **`time.Ticker`** — простейший, но без burst и с утечкой.
+- **Token bucket** — ведро с токенами.
+- **Burst** — запас на пики.
+- **Burst 10–100** для большинства API.
+- **`golang.org/x/time/rate`** — production-ready.
+- **`rate.NewLimiter(rps, burst)`.**
+- **`Wait(ctx)`** — блокирующее ожидание.
+- **`Allow()`** — неблокирующая проверка.
+- **`context`** — для отмены.
+- **Worker pool + rate limiter** — параллелизм + скорость.
+- **Rate limiter + circuit breaker** — защита API.
+- **Метрики:** allowed, waited, denied.
 
 ---
 
-## 14.11 Ответы
+## 14.11 Вопросы для самопроверки
+
+1. Что такое rate limiter? Какую задачу решает?
+2. Чем rate limiter отличается от worker pool?
+3. Что такое token bucket?
+4. Что такое burst? Зачем нужен?
+5. Почему `time.Tick` — плохо?
+6. Как использовать `golang.org/x/time/rate`?
+7. Зачем `context` в rate limiter?
+8. Как комбинировать rate limiter с worker pool?
+
+---
+
+## 14.12 Ответы
 
 ### Ответ 1
 
-**Семафор:**
-
-```go
-sem := make(chan struct{}, maxConcurrent)
-
-select {
-case sem <- struct{}{}:
-    defer func() { <-sem }()
-case <-ctx.Done():
-    return
-case <-time.After(1 * time.Second):
-    http.Error(w, "server busy", 503)
-    return
-}
-```
+**Rate limiter** — примитив для ограничения **скорости** (операций/сек). Решает задачу: **не более N операций за период**. Для внешних API с лимитами.
 
 ### Ответ 2
 
-**Rate limiter:**
+**Worker pool** ограничивает **параллелизм** — сколько операций одновременно. **Rate limiter** — **скорость** — сколько за период.
 
-```go
-limiter := rate.NewLimiter(rate.Limit(rps), burst)
+**Worker pool N=10:** 10 одновременных. Если 1 мс — 10 000/сек.
 
-if !limiter.Allow() {
-    http.Error(w, "too many requests", 429)
-    return
-}
-```
+**Rate limiter 100/сек:** всегда 100/сек, независимо от параллелизма.
 
 ### Ответ 3
 
-**Worker pool:**
+**Token bucket** — ведро с токенами. Токены добавляются со скоростью `rate`. Ведро максимум `burst`. Запрос забирает токен. Если пусто — ждёт.
 
-```go
-messagesCh := make(chan Message, 100)
-
-var wg sync.WaitGroup
-for i := 0; i < workers; i++ {
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        for msg := range messagesCh {
-            process(msg)
-        }
-    }()
-}
-```
+**Реализация на каналах:** буфер канала = `burst`, токены = элементы.
 
 ### Ответ 4
 
-**Batch commit** — коммит группы сообщений вместо каждого.
+**Burst** — максимальное число токенов. Позволяет **накопить запас** и потратить сразу.
 
-**Зачем:** производительность (меньше I/O).
+**Пример:** лимитер 100/сек, burst 10. Первые 10 запросов — мгновенно. Дальше — по 10 мс.
+
+**Размер:** 10–100 для большинства API. 1 — нет пиков. 10 000 — почти не ограничивает.
 
 ### Ответ 5
 
-**DLQ** (Dead Letter Queue) — очередь для сообщений, которые не удалось обработать.
+**`time.Tick` — плохо**, потому что:
+1. **Не останавливается** — утечка таймера.
+2. **Нет burst** — нельзя накопить запас.
+3. **Неточен** при высоких rps.
+
+**Решение:** `time.NewTicker` + `Stop`. Или `x/time/rate`.
 
 ### Ответ 6
 
-**ETL:**
-
 ```go
-sourceCh := source(ctx)
-transformCh := transform(ctx, sourceCh, 10)
-sink(ctx, transformCh)
+limiter := rate.NewLimiter(rate.Limit(100), 10)
+if err := limiter.Wait(ctx); err != nil {
+    return err
+}
 ```
+
+- **100** — RPS.
+- **10** — burst.
+- **`Wait(ctx)`** — ждать разрешения.
+- **`Allow()`** — неблокирующая проверка.
 
 ### Ответ 7
 
-**Backpressure** — медленная стадия замедляет быструю. Через буферизованные каналы.
+**`context`** позволяет не блокироваться навсегда, если rate limiter не даёт токенов. Без него — **зависание**.
+
+**`Wait(ctx)`** проверяет `ctx`. Если отменён — возвращает ошибку.
 
 ### Ответ 8
 
-**Scraper:**
+**Worker pool + rate limiter:**
 
 ```go
-body, err := scraper.fetch(ctx, url)
-```
-
-С rate limiter → circuit breaker → semaphore → HTTP.
-
-### Ответ 9
-
-**Rate limiter первым**, чтобы не тратить ресурсы на запросы, которые всё равно будут отклонены.
-
-### Ответ 10
-
-**Circuit breaker** — защита от каскадных отказов. Три состояния: Closed, Open, Half-Open.
-
-### Ответ 11
-
-**errgroup** + общий ctx:
-
-```go
-g, ctx := errgroup.WithContext(ctx)
-
-g.Go(func() error { return s.runHTTP(ctx) })
-g.Go(func() error { return s.consumer.Run(ctx) })
-
-return g.Wait()
-```
-
-### Ответ 12
-
-**pprof goroutine dump:**
-
-```bash
-curl http://localhost:6060/debug/pprof/goroutine?debug=2
-```
-
-### Ответ 13
-
-**Mutex profile:**
-
-```go
-runtime.SetMutexProfileFraction(1)
-```
-
-```bash
-go tool pprof mutex.prof
-```
-
-### Ответ 14
-
-**Goroutine dump:**
-
-```bash
-kill -QUIT <pid>
-```
-
-Искать горутины в `semacquire`.
-
-### Ответ 15
-
-```go
-func TestServer(t *testing.T) {
-    defer goleak.VerifyNone(t)
-    
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-    
-    srv := NewServer(":0", 10, 100)
-    go srv.Run(ctx)
-    
-    time.Sleep(100 * time.Millisecond)
-    
-    resp, _ := http.Get("http://localhost:8080/healthz")
-    // ...
+func worker(ctx context.Context, tasksCh <-chan Task, limiter *rate.Limiter) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case task, ok := <-tasksCh:
+            if !ok {
+                return
+            }
+            if err := limiter.Wait(ctx); err != nil {
+                return
+            }
+            process(task)
+        }
+    }
 }
 ```
 
-### Ответ 16
-
-Mock-интерфейс:
-
-```go
-type MockConsumer struct {
-    messages []Message
-    idx      int
-}
-```
-
-### Ответ 17
-
-`httptest.NewServer`:
-
-```go
-srv := httptest.NewServer(handler)
-defer srv.Close()
-```
-
-### Ответ 18
-
-**Обязательные метрики:**
-- Goroutines.
-- Memory.
-- GC.
-- HTTP requests, latency, errors.
-- Kafka lag.
-- Circuit breaker state.
+Worker pool ограничивает параллелизм, rate limiter — скорость.
 
 ---
 
-## 14.12 Куда идти дальше?
+## 14.13 Куда идти дальше?
 
-Мы разобрали реальные сценарии: HTTP, очереди, ETL, scraping. Теперь мы умеем **строить production-ready сервисы**.
+Мы разобрали rate limiter — ограничение скорости. Теперь мы умеем не перегружать внешние API.
 
-**Что дальше:**
+Но что если внешний сервис всё равно **падает**? Что если 50% запросов возвращают 500?
 
-- **Приложение A:** Шпаргалка по каналам.
-- **Приложение B:** Шпаргалка по sync.
-- **Приложение C:** Шпаргалка по контексту.
-- **Приложение D:** Шпаргалка по планировщику.
-- **Приложение E:** Инструменты и метрики.
-
-**Или:** применяй знания в своих проектах.
+- **Как защититься от отказов?** → **Глава 15: Circuit breaker.**
+- **Как повторять неудачные операции?** → **Глава 16: Retry.**
+- **Как ограничить время операции?** → **Глава 17: Timeout.**
 
 ---
 
-## 14.13 Чек-лист
+## 14.14 Чек-лист
 
-| Сценарий | Компоненты |
-|:---|:---|
-| **HTTP** | Семафор + rate limiter + graceful shutdown |
-| **Consumer** | Worker pool + batch commit + drain + retry + DLQ |
-| **ETL** | Pipeline + fan-out + batch + backpressure |
-| **Scraper** | Rate limiter + circuit breaker + semaphore + retry |
-| **Комбинированный** | errgroup + общий ctx |
-| **Диагностика** | pprof, метрики, goroutine dump |
-| **Тестирование** | goleak, -race, mock, stress |
-| **Health checks** | `/healthz`, `/readyz` |
-| **Метрики** | goroutines, memory, GC, HTTP, Kafka |
-| **Graceful shutdown** | 25 секунд |
-| **Retry** | 3 попытки с backoff |
-| **DLQ** | Для permanent ошибок |
+| Компонент | Что это | Ключевые факты |
+|:---|:---|:---|
+| **Rate limiter** | Ограничение скорости | Операций/сек |
+| **`time.Ticker`** | Простейший | Без burst, утечка |
+| **Token bucket** | Ведро с токенами | Буфер канала = burst |
+| **Burst** | Запас на пики | 10–100 для API |
+| **`x/time/rate`** | Production-ready | `NewLimiter(rps, burst)` |
+| **`Wait(ctx)`** | Блокирующее | Ждёт разрешения |
+| **`Allow()`** | Неблокирующее | Проверка без ожидания |
+| **`Reserve()`** | Резервирование | С задержкой |
+| **`context`** | Отмена | `Wait(ctx)` |
+| **Worker pool + rate limiter** | Параллелизм + скорость | Классика |
+| **Rate limiter + circuit breaker** | Защита API | — |
+| **Метрики** | allowed, waited, denied | `atomic.Int64` |
 
-🌍 **Ключевая идея:** Реальные сценарии комбинируют все паттерны. **HTTP:** семафор для ограничения, rate limiter для DDoS, graceful shutdown. **Consumer:** worker pool, batch commit, drain, retry, DLQ. **ETL:** pipeline, fan-out, batch, backpressure. **Scraper:** rate limiter → circuit breaker → semaphore + retry. **Комбинированный:** errgroup + общий ctx. **Диагностика:** pprof, метрики, goroutine dump. **Тестирование:** goleak, -race, mock, stress. **Метрики:** goroutines, memory, GC, HTTP, Kafka. **Graceful shutdown:** 25 секунд. **Retry:** 3 попытки с backoff. **DLQ:** для permanent ошибок.
+⏱️ **Ключевая идея:** Rate limiter — ограничение **скорости** операций. **Token bucket** — ведро с токенами: `rate` токенов/сек, максимум `burst`. **Burst** — для пиков (10–100 для API). **`golang.org/x/time/rate`** — production-ready. **`Wait(ctx)`** — блокирующее ожидание, **`Allow()`** — неблокирующее. **`context`** для отмены. Комбинируется с worker pool, pipeline, circuit breaker, semaphore. **Worker pool** ограничивает параллелизм, **rate limiter** — скорость. **Worker pool + rate limiter** — классическая связка для внешних API. `time.Tick` — утечка, не используй.

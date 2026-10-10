@@ -1,677 +1,437 @@
-# 🔁 Глава 15: Каналы — динамический select и приоритеты
+# ⚡ Глава 15: Circuit breaker — защита от отказов
 
 **Что вы узнаете:**
-- Почему `select` работает только с **фиксированным** набором case'ов.
-- Что такое **`reflect.Select`** и как он решает проблему.
-- Как построить **динамический fan-in** для переменного числа каналов.
-- Как эмулировать **приоритетный select**.
-- Что такое **starvation** в `select` и как его избежать.
-- Как **`reflect.Select`** соотносится с обычным `select` по производительности.
-- Когда **`reflect.Select`** — правильный выбор, а когда — нет.
+- Что такое circuit breaker и какую задачу он решает.
+- Три состояния circuit breaker: Closed, Open, Half-Open.
+- Как построить circuit breaker с нуля.
+- Как настроить threshold и timeout.
+- Как обрабатывать ошибки и успехи.
+- Как комбинировать circuit breaker с retry, rate limiter, worker pool.
+- Как использовать `github.com/sony/gobreaker`.
 
 **После прочтения вы сможете:**
-- Использовать `reflect.Select` для динамического набора каналов.
-- Построить приоритетный `select` через двойной `select`.
-- Понимать, когда `reflect.Select` оправдан, а когда — нет.
-- Избегать starvation при приоритетах.
-- Писать fan-in с переменным числом каналов.
+- Построить circuit breaker с нуля.
+- Настраивать threshold и timeout.
+- Обрабатывать переходы между состояниями.
+- Использовать circuit breaker в HTTP-клиентах.
+- Комбинировать circuit breaker с другими паттернами.
+- Понимать, где circuit breaker уместен, а где — нет.
 
 ---
 
 ## Содержание
 
-- [15.0 Пролог: каналы, число которых известно только в runtime](#150-пролог-каналы-число-которых-известно-только-в-runtime)
-- [15.1 Ограничение select: фиксированный набор case'ов](#151-ограничение-select-фиксированный-набор-caseов)
-- [15.2 reflect.Select: динамический select](#152-reflectselect-динамический-select)
-- [15.3 Динамический fan-in](#153-динамический-fan-in)
-- [15.4 Приоритетный select](#154-приоритетный-select)
-- [15.5 Starvation в select и как его избежать](#155-starvation-в-select-и-как-его-избежать)
-- [15.6 Производительность: reflect.Select vs N горутин](#156-производительность-reflectselect-vs-n-горутин)
-- [15.7 Практика Go: динамический fan-in с метриками](#157-практика-go-динамический-fan-in-с-метриками)
-- [15.8 Выводы и типичные ошибки](#158-выводы-и-типичные-ошибки)
-- [15.9 Для быстрого повторения](#159-для-быстрого-повторения)
-- [15.10 Вопросы для самопроверки](#1510-вопросы-для-самопроверки)
-- [15.11 Ответы](#1511-ответы)
-- [15.12 Куда идти дальше?](#1512-куда-идти-дальше)
-- [15.13 Чек-лист](#1513-чек-лист)
+- [15.0 Пролог: каскадный отказ](#150-пролог-каскадный-отказ)
+- [15.1 Что такое circuit breaker](#151-что-такое-circuit-breaker)
+- [15.2 Простейший circuit breaker](#152-простейший-circuit-breaker)
+- [15.3 Circuit breaker с threshold и timeout](#153-circuit-breaker-с-threshold-и-timeout)
+- [15.4 Half-Open: пробные запросы](#154-half-open-пробные-запросы)
+- [15.5 Circuit breaker с context](#155-circuit-breaker-с-context)
+- [15.6 gobreaker: production-ready](#156-gobreaker-production-ready)
+- [15.7 В связке с другими паттернами](#157-в-связке-с-другими-паттернами)
+- [15.8 Практика Go: circuit breaker с метриками](#158-практика-go-circuit-breaker-с-метриками)
+- [15.9 Выводы и типичные ошибки](#159-выводы-и-типичные-ошибки)
+- [15.10 Для быстрого повторения](#1510-для-быстрого-повторения)
+- [15.11 Вопросы для самопроверки](#1511-вопросы-для-самопроверки)
+- [15.12 Ответы](#1512-ответы)
+- [15.13 Куда идти дальше?](#1513-куда-идти-дальше)
+- [15.14 Чек-лист](#1514-чек-лист)
 
 ---
 
-## 15.0 Пролог: каналы, число которых известно только в runtime
+## 15.0 Пролог: каскадный отказ
 
-Ты пишешь сервис, который агрегирует данные из **нескольких источников**. Источники приходят **динамически** — из конфига, из service discovery, из API.
+У нас есть сервис, который ходит за обогащением в другой сервис. Работает так: клиент приходит к нам, мы делаем HTTP-запрос к сервису-обогатителю, получаем данные, отдаём клиенту.
 
 ```go
-func mergeAll(sources []<-chan Event) <-chan Event {
-    out := make(chan Event)
-    // Как написать select, если число каналов неизвестно?
-    // select { case v := <-sources[0]: ... case v := <-sources[1]: ... }
-    // Но sources может быть 3, 10, 100...
-    return out
+func handler(w http.ResponseWriter, r *http.Request) {
+    user, err := fetchFromExternal(r.Context())
+    if err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+    json.NewEncoder(w).Encode(user)
 }
 ```
 
-❓ **Проблема:** `select` требует **фиксированного** набора case'ов. Нельзя написать «`select` по N каналам», если N известно только в runtime.
+Работает. Пока внешний сервис не начал **тормозить**. Запрос висит 5 секунд. Клиенты ждут. Горутины копятся. Память растёт.
 
-💡 **Решение:** **`reflect.Select`**. Он принимает **слайс** case'ов и динамически выбирает готовый.
+Через минуту внешний сервис падает совсем. Все 100% запросов к нему возвращают ошибку **за 5 секунд** (timeout). Наш сервис ждёт 5 секунд на каждый запрос, потом возвращает 500.
 
-```go
-func mergeAll(sources []<-chan Event) <-chan Event {
-    out := make(chan Event)
+**Что происходит:**
 
-    go func() {
-        defer close(out)
+- Клиенты ждут 5 секунд впустую.
+- Горутины копятся (10 000 одновременно).
+- Память растёт.
+- Мы **знаем**, что внешний сервис **не работает**, но продолжаем его вызывать.
 
-        cases := make([]reflect.SelectCase, len(sources))
-        for i, ch := range sources {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
-        }
+Хочется **перестать вызывать** внешний сервис, когда он **гарантированно** не работает. Не ждать 5 секунд впустую, а **сразу вернуть ошибку**. И периодически **проверять**, не восстановился ли сервис.
 
-        for len(cases) > 0 {
-            i, v, ok := reflect.Select(cases)
-            if !ok {
-                // Канал i закрыт — удаляем из cases
-                cases = append(cases[:i], cases[i+1:]...)
-                continue
-            }
-            out <- v.Interface().(Event)
-        }
-    }()
+Это и есть **circuit breaker**.
 
-    return out
-}
-```
-
-**Что делает:**
-
-1. Создаёт `reflect.SelectCase` для каждого канала.
-2. `reflect.Select` выбирает готовый case.
-3. Если канал закрыт — удаляет его из `cases`.
-4. Продолжает, пока есть активные каналы.
-
-**Это динамический fan-in.** Работает для любого числа каналов.
-
-> **Важный мост к будущим главам:** `reflect.Select` — инструмент для **динамических** сценариев. Он редко нужен, но когда нужен — незаменим. Глава 16 (Lock-free) — про другой способ работы с динамикой. Глава 19 (Паттерны) — про distributed locks и leader election.
+> **Мост к следующим главам:** circuit breaker — важный инструмент для защиты от каскадных отказов. Он часто используется вместе с rate limiter (Глава 14) и retry (Глава 16). Понимание circuit breaker даёт понимание, **как не рушить свой сервис чужими проблемами**.
 
 ---
 
-## 15.1 Ограничение select: фиксированный набор case'ов
+## 15.1 Что такое circuit breaker
 
-Прежде чем разбирать `reflect.Select`, поймём **ограничение** обычного `select`.
+**Circuit breaker** — паттерн, который **прекращает** вызовы к сломанному сервису.
 
-### Синтаксис select
+### Идея
 
-```go
-select {
-case v := <-ch1:
-    // получение из ch1
-case ch2 <- 42:
-    // отправка в ch2
-case <-done:
-    // закрытие done
-default:
-    // ни один case не готов
-}
+Как **электрический предохранитель**: при коротком замыкании он **разрывает цепь**, чтобы не сгорела вся система.
+
+### Три состояния
+
+**1. Closed (закрыт).**
+
+Все запросы **проходят** к внешнему сервису. Считаем ошибки.
+
+**2. Open (открыт).**
+
+Все запросы **отклоняются** немедленно. Не ждём внешний сервис. Ждём `timeout`.
+
+**3. Half-Open (полуоткрыт).**
+
+Пропускаем **1 пробный запрос**. Если успех — возвращаемся в Closed. Если ошибка — снова Open.
+
+### Схема
+
+```
+                       Ошибок > threshold
+     ┌────────┐  ─────────────────────────▶  ┌────────┐
+     │ Closed │                               │  Open  │
+     └────────┘  ◀─────────────────────────  └────────┘
+         ▲                Успех                  │
+         │                                       │
+         │                                  timeout
+         │                                       │
+         │          ┌──────────┐               │
+         └──────────│Half-Open │◀──────────────┘
+            Успех   └──────────┘
+                          │
+                     Ошибка
+                          │
+                          ▼
+                     ┌────────┐
+                     │  Open  │
+                     └────────┘
 ```
 
-**Ключевое:** case'ы **фиксированы** на этапе компиляции. Компилятор генерирует код для **каждого** case'а.
+### Когда использовать circuit breaker
 
-### Что нельзя сделать
+**1. Внешние сервисы.**
 
-**1. Динамическое число каналов.**
+- HTTP API.
+- gRPC.
+- БД.
+- Другие внутренние сервисы.
 
-```go
-// ❌ Нельзя:
-channels := []<-chan int{ch1, ch2, ch3}
-select {
-case v := <-channels[i]:  // i — переменная
-    // ...
-}
-```
+**2. Медленные сервисы.**
 
-**Компилятор не знает**, сколько каналов и какие. `select` не работает с индексами.
+- Если сервис может тормозить — circuit breaker защитит.
+- Если сервис быстрый — не нужен.
 
-**2. Переменные в case.**
+**3. Критичные пути.**
 
-```go
-// ❌ Нельзя:
-for i, ch := range channels {
-    select {
-    case v := <-ch:  // ch — переменная, но case'ов всё равно N
-        // ...
-    }
-}
-```
+- Если сбой сервиса ломает весь наш сервис — нужен circuit breaker.
 
-**Это N отдельных `select`**, а не один. Если `ch` не готов — `select` блокируется на **одном** канале, а не ждёт **все**.
+### Когда НЕ использовать circuit breaker
 
-**3. Case'ы, известные только в runtime.**
+**1. Внутренние операции.**
 
-```go
-// ❌ Нельзя:
-func merge(channels []<-chan int) <-chan int {
-    select {
-    case v := <-channels[0]:  // а если channels пуст?
-    case v := <-channels[1]:  // а если длина 3?
-    // ...
-    }
-}
-```
+Для внутренних функций — overhead.
 
-### Обходной путь: N горутин
+**2. Быстрые сервисы.**
 
-**Для fan-in с фиксированным числом каналов** мы использовали N горутин (Глава 8):
+Если сервис отвечает за 1 мс — circuit breaker не нужен.
 
-```go
-func merge(channels ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+**3. Одиночные вызовы.**
 
-    for _, ch := range channels {
-        wg.Add(1)
-        go func(c <-chan int) {
-            defer wg.Done()
-            for v := range c {
-                out <- v
-            }
-        }(ch)
-    }
+Для редких операций — overhead.
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+### Circuit breaker vs retry
 
-    return out
-}
-```
+**Retry** — повторяет неудачные операции. **Circuit breaker** — прекращает вызовы.
 
-**Что делает:** для **каждого** канала — **отдельная** горутина. Каждая читает из своего канала и пишет в общий `out`.
+**Вместе:**
 
-**Плюсы:**
+- Retry: пробуем N раз.
+- Circuit breaker: если N раз упало — прекращаем вызывать.
 
-- Просто.
-- Работает для любого числа каналов.
-
-**Минусы:**
-
-- **N + 1 горутин** — для 1000 каналов это 1001 горутина.
-- **Память:** (N + 1) × 2.3 КБ = ~2.3 МБ для 1000 каналов.
-- **Contention:** все горутины пишут в **один** `out`.
-
-### Обходной путь: фиксированный select
-
-**Для малого числа каналов** можно использовать фиксированный `select`:
-
-```go
-func merge3(ch1, ch2, ch3 <-chan int) <-chan int {
-    out := make(chan int)
-
-    go func() {
-        defer close(out)
-
-        for {
-            select {
-            case v, ok := <-ch1:
-                if !ok {
-                    ch1 = nil
-                } else {
-                    out <- v
-                }
-            case v, ok := <-ch2:
-                if !ok {
-                    ch2 = nil
-                } else {
-                    out <- v
-                }
-            case v, ok := <-ch3:
-                if !ok {
-                    ch3 = nil
-                } else {
-                    out <- v
-                }
-            }
-
-            if ch1 == nil && ch2 == nil && ch3 == nil {
-                return
-            }
-        }
-    }()
-
-    return out
-}
-```
-
-**Что делает:** `ch1 = nil` отключает case (nil-канал блокируется навсегда, Глава 2).
-
-**Плюсы:**
-
-- **Одна горутина** вместо N.
-- **Меньше contention.**
-
-**Минусы:**
-
-- **Фиксированное число каналов** — код генерируется для 3.
-- **Много кода** для каждого N.
-
-### Сравнение
-
-| Подход | Горутин | Каналов | Код |
-|:---|:---|:---|:---|
-| N горутин | N + 1 | Любое | Простой |
-| Фиксированный select | 1 | Фиксированное | Много |
-| `reflect.Select` | 1 | Любое | Средний |
-
-### Аннотация сложности
-
-| Операция | Time | Space |
-|:---|:---|:---|
-| `select` (фиксированный) | ~100-200 нс | 0 |
-| N горутин | ~100-200 нс на элемент | N × 2.3 КБ |
-| `reflect.Select` | ~500-1000 нс | ~100 байт на case |
-
-### 💡 Практика: как обходить ограничение select
+### 💡 Практика: как думать о circuit breaker
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Для фиксированного числа каналов** — обычный `select`.
-2. **Для многих каналов** — N горутин или `reflect.Select`.
-3. **Для динамического числа** — `reflect.Select`.
+1. **Circuit breaker — для внешних сервисов.**
+2. **Threshold 5–10 ошибок.**
+3. **Timeout 10–60 секунд.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **`ch = nil`** для отключения case.
+4. **Circuit breaker + retry** — полная защита.
+5. **Circuit breaker + rate limiter** — для API.
 
 **❌ НЕ ДЕЛАЙ:**
 
-5. **Не пиши `select` с индексами** — не работает.
-6. **Не создавай N горутин** для тысяч каналов.
-
-### Ключевые выводы подглавы 15.1
-
-- **`select` фиксирован** на этапе компиляции.
-- **N горутин** — обходной путь для многих каналов.
-- **`ch = nil`** — отключение case.
-- **`reflect.Select`** — для динамических каналов.
+6. **Не используй circuit breaker для внутренних операций.**
+7. **Не ставь threshold 1** — ложные срабатывания.
 
 ---
 
-## 15.2 reflect.Select: динамический select
+## 15.2 Простейший circuit breaker
 
-**`reflect.Select`** — динамический аналог `select`.
+Начнём с самого простого — circuit breaker, который считает **последовательные** ошибки.
 
-### API
+### Идея
+
+- При ошибке — увеличиваем счётчик.
+- При успехе — сбрасываем счётчик.
+- Если счётчик > threshold — открываем.
+
+### Реализация
 
 ```go
-import "reflect"
-
-type SelectCase struct {
-    Dir  SelectDir   // SelectRecv, SelectSend, SelectDefault
-    Chan Value       // канал
-    Send Value       // значение для отправки (для SelectSend)
+type SimpleBreaker struct {
+    threshold  int
+    failures   int
+    state      State
+    mu         sync.Mutex
 }
 
-func Select(cases []SelectCase) (chosen int, recv Value, recvOK bool)
-```
+type State int
 
-**Что делает:**
+const (
+    StateClosed State = iota
+    StateOpen
+)
 
-- Принимает **слайс** case'ов.
-- Возвращает **индекс** выбранного case'а.
-- Для `SelectRecv` — полученное значение и `ok`.
-- Для `SelectSend` — `recv` = zero Value.
-- Для `SelectDefault` — выбирается, если ни один не готов.
+var ErrCircuitOpen = errors.New("circuit breaker is open")
 
-### Три типа case'ов
+func NewSimpleBreaker(threshold int) *SimpleBreaker {
+    return &SimpleBreaker{
+        threshold: threshold,
+        state:     StateClosed,
+    }
+}
 
-| Dir | Значение |
-|:---|:---|
-| `SelectRecv` | Получение из канала |
-| `SelectSend` | Отправка в канал |
-| `SelectDefault` | Default case |
-
-### Пример: получение из N каналов
-
-```go
-func merge(channels []<-chan int) <-chan int {
-    out := make(chan int)
-
-    go func() {
-        defer close(out)
-
-        cases := make([]reflect.SelectCase, len(channels))
-        for i, ch := range channels {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
+func (b *SimpleBreaker) Call(fn func() error) error {
+    b.mu.Lock()
+    if b.state == StateOpen {
+        b.mu.Unlock()
+        return ErrCircuitOpen
+    }
+    b.mu.Unlock()
+    
+    err := fn()
+    
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    if err != nil {
+        b.failures++
+        if b.failures >= b.threshold {
+            b.state = StateOpen
         }
-
-        for len(cases) > 0 {
-            i, v, ok := reflect.Select(cases)
-            if !ok {
-                // Канал i закрыт — удаляем
-                cases = append(cases[:i], cases[i+1:]...)
-                continue
-            }
-            out <- int(v.Int())
-        }
-    }()
-
-    return out
+    } else {
+        b.failures = 0
+    }
+    return err
 }
 ```
 
-**Разберём по шагам.**
+**Что происходит:**
 
-#### Шаг 1: подготовка cases
+1. `Call` проверяет состояние.
+2. Если Open — возвращает `ErrCircuitOpen`.
+3. Иначе вызывает `fn`.
+4. При ошибке — счётчик увеличивается.
+5. При успехе — счётчик сбрасывается.
+
+### Потребитель
 
 ```go
-cases := make([]reflect.SelectCase, len(channels))
-for i, ch := range channels {
-    cases[i] = reflect.SelectCase{
-        Dir:  reflect.SelectRecv,
-        Chan: reflect.ValueOf(ch),
+func main() {
+    breaker := NewSimpleBreaker(3)
+    
+    for i := 0; i < 10; i++ {
+        err := breaker.Call(func() error {
+            return errors.New("service unavailable")
+        })
+        fmt.Printf("Call %d: %v\n", i, err)
     }
 }
 ```
 
-**Что делает:** создаёт case для каждого канала.
+**Пример вывода:**
 
-**`reflect.ValueOf(ch)`** — оборачивает канал в `reflect.Value`.
-
-#### Шаг 2: цикл select
-
-```go
-for len(cases) > 0 {
-    i, v, ok := reflect.Select(cases)
-    // ...
-}
+```
+Call 0: service unavailable
+Call 1: service unavailable
+Call 2: service unavailable
+Call 3: circuit breaker is open
+Call 4: circuit breaker is open
+Call 5: circuit breaker is open
+Call 6: circuit breaker is open
+Call 7: circuit breaker is open
+Call 8: circuit breaker is open
+Call 9: circuit breaker is open
 ```
 
-**Что делает:** `reflect.Select` выбирает **готовый** case (случайно из готовых, как обычный `select`).
+**Что видно:** после 3 ошибок circuit breaker **открыт**. Все последующие вызовы **отклоняются** немедленно.
 
-#### Шаг 3: обработка закрытия
+### Проблема: не восстановится
 
-```go
-if !ok {
-    cases = append(cases[:i], cases[i+1:]...)
-    continue
-}
+**Что если сервис восстановился?** Circuit breaker останется Open **навсегда**. Нужно **Half-Open**.
+
+### Проблема: нет timeout
+
+Без timeout circuit breaker не знает, когда **пробовать** восстановление.
+
+### Схема
+
+```
+Call(fn):
+
+  ┌───────────────────────┐
+  │ state == Open?        │
+  │   → ErrCircuitOpen    │
+  └───────────┬───────────┘
+              │
+              │ Нет
+              ▼
+  ┌───────────────────────┐
+  │ err := fn()           │
+  └───────────┬───────────┘
+              │
+              ▼
+  ┌───────────────────────┐
+  │ err != nil?           │
+  │   failures++          │
+  │   if failures >= N:   │
+  │     state = Open      │
+  │ else:                 │
+  │   failures = 0        │
+  └───────────────────────┘
 ```
 
-**Что делает:** если канал `i` закрыт — удаляем его из `cases`.
-
-**Почему `append(cases[:i], cases[i+1:]...)`:** удаляет элемент по индексу `i`.
-
-#### Шаг 4: запись в out
-
-```go
-out <- int(v.Int())
-```
-
-**Что делает:** `v` — `reflect.Value`, `v.Int()` — `int64`, приводим к `int`.
-
-### Пример: отправка
-
-```go
-func broadcast(value int, channels []chan<- int) {
-    cases := make([]reflect.SelectCase, len(channels))
-    for i, ch := range channels {
-        cases[i] = reflect.SelectCase{
-            Dir:  reflect.SelectSend,
-            Chan: reflect.ValueOf(ch),
-            Send: reflect.ValueOf(value),
-        }
-    }
-
-    for len(cases) > 0 {
-        i, _, ok := reflect.Select(cases)
-        if !ok {
-            // Канал i закрыт — отправка не удалась
-            cases = append(cases[:i], cases[i+1:]...)
-            continue
-        }
-        // Успешно отправили в канал i
-        // Можно удалить, если не нужно отправлять ещё
-        cases = append(cases[:i], cases[i+1:]...)
-    }
-}
-```
-
-**Что делает:** отправляет `value` в **каждый** канал из `channels`.
-
-**`SelectSend`:** `reflect.Select` вернёт `i` того канала, в который **удалось** отправить.
-
-### Пример: default
-
-```go
-func tryRecv(ch <-chan int) (int, bool) {
-    cases := []reflect.SelectCase{
-        {
-            Dir:  reflect.SelectRecv,
-            Chan: reflect.ValueOf(ch),
-        },
-        {
-            Dir: reflect.SelectDefault,
-        },
-    }
-
-    i, v, ok := reflect.Select(cases)
-    if i == 1 {
-        // default — канал не готов
-        return 0, false
-    }
-    if !ok {
-        // канал закрыт
-        return 0, false
-    }
-    return int(v.Int()), true
-}
-```
-
-**Что делает:** неблокирующая проверка канала.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `reflect.ValueOf` | ~50-100 нс |
-| `reflect.Select` (1 case) | ~500-1000 нс |
-| `reflect.Select` (10 cases) | ~500-1000 нс |
-| `reflect.Select` (100 cases) | ~500-1000 нс |
-
-**Ключевое:** `reflect.Select` **не зависит** от числа case'ов линейно. Он использует ту же логику, что обычный `select` (случайный выбор из готовых).
-
-**Но:** `reflect` **медленнее** обычного `select` в ~5-10 раз из-за динамической типизации.
-
-### 💡 Практика: как использовать reflect.Select
+### 💡 Практика: как писать простой circuit breaker
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **`reflect.SelectCase`** для каждого канала.
-2. **Удаляй закрытые каналы** из `cases`.
-3. **`reflect.ValueOf(ch)`** для обёртки канала.
+1. **Счётчик ошибок.**
+2. **`Mutex` для состояния.**
+3. **`ErrCircuitOpen`.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **Проверяй `ok`** после `reflect.Select`.
-5. **Используй для динамических случаев** — N неизвестно.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-6. **Для фиксированных случаев** — обычный `select` быстрее.
+4. **`Call(fn)` — универсальный интерфейс.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не используй `reflect.Select` в hot path.** Он медленнее.
-8. **Не забывай удалять закрытые каналы.** Иначе бесконечный цикл.
-
-### Ключевые выводы подглавы 15.2
-
-- **`reflect.Select`** — динамический `select`.
-- **`SelectCase`** — case для каждого канала.
-- **`SelectRecv`, `SelectSend`, `SelectDefault`** — три типа.
-- **Удаляй закрытые каналы** из `cases`.
-- **Медленнее обычного `select`** в 5-10 раз.
+5. **Не забывай про Half-Open.**
+6. **Не блокируйся навсегда при Open.**
 
 ---
 
-## 15.3 Динамический fan-in
+## 15.3 Circuit breaker с threshold и timeout
 
-Разберём **динамический fan-in** — слияние переменного числа каналов.
+Добавим timeout — через какое время пробовать **Half-Open**.
 
-### Проблема
+### Идея
 
-**Дано:** слайс каналов `[]<-chan T` неизвестной длины.
+- **Closed:** считаем ошибки. Если > threshold → Open.
+- **Open:** все запросы отклоняются. Ждём `timeout`.
+- **После timeout:** переходим в Half-Open.
 
-**Нужно:** один канал, в который идут значения из всех.
-
-### Решение через N горутин
+### Реализация
 
 ```go
-func fanInGoroutines(channels []<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+type CircuitBreaker struct {
+    threshold       int
+    timeout         time.Duration
+    failures        int
+    lastFailureTime time.Time
+    state           State
+    mu              sync.Mutex
+}
 
-    for _, ch := range channels {
-        wg.Add(1)
-        go func(c <-chan int) {
-            defer wg.Done()
-            for v := range c {
-                out <- v
-            }
-        }(ch)
+type State int
+
+const (
+    StateClosed State = iota
+    StateOpen
+    StateHalfOpen
+)
+
+var ErrCircuitOpen = errors.New("circuit breaker is open")
+
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+    return &CircuitBreaker{
+        threshold: threshold,
+        timeout:   timeout,
+        state:     StateClosed,
     }
+}
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+func (b *CircuitBreaker) Call(fn func() error) error {
+    if err := b.beforeCall(); err != nil {
+        return err
+    }
+    
+    err := fn()
+    b.afterCall(err)
+    return err
+}
 
-    return out
+func (b *CircuitBreaker) beforeCall() error {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    switch b.state {
+    case StateClosed:
+        return nil
+    case StateOpen:
+        if time.Since(b.lastFailureTime) > b.timeout {
+            b.state = StateHalfOpen
+            return nil  // пробный запрос
+        }
+        return ErrCircuitOpen
+    case StateHalfOpen:
+        return nil  // один пробный
+    }
+    return nil
+}
+
+func (b *CircuitBreaker) afterCall(err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    if err != nil {
+        b.failures++
+        b.lastFailureTime = time.Now()
+        if b.failures >= b.threshold {
+            b.state = StateOpen
+        }
+        if b.state == StateHalfOpen {
+            b.state = StateOpen  // ошибка в Half-Open
+        }
+    } else {
+        b.failures = 0
+        if b.state == StateHalfOpen {
+            b.state = StateClosed
+        }
+    }
 }
 ```
 
-**Плюсы:**
+**Что происходит:**
 
-- Просто.
-- Работает для любого N.
-
-**Минусы:**
-
-- **N + 1 горутин.**
-- **Contention** на `out`.
-
-### Решение через reflect.Select
-
-```go
-func fanInReflect(channels []<-chan int) <-chan int {
-    out := make(chan int)
-
-    go func() {
-        defer close(out)
-
-        cases := make([]reflect.SelectCase, len(channels))
-        for i, ch := range channels {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
-        }
-
-        for len(cases) > 0 {
-            i, v, ok := reflect.Select(cases)
-            if !ok {
-                cases = append(cases[:i], cases[i+1:]...)
-                continue
-            }
-            out <- int(v.Int())
-        }
-    }()
-
-    return out
-}
-```
-
-**Плюсы:**
-
-- **Одна горутина.**
-- **Меньше contention.**
-- **Меньше памяти.**
-
-**Минусы:**
-
-- **`reflect` медленнее.**
-- **Сложнее код.**
-
-### Сравнение
-
-| Подход | Горутин | Память | Time (per element) |
-|:---|:---|:---|:---|
-| N горутин | N + 1 | (N + 1) × 2.3 КБ | ~50-100 нс |
-| `reflect.Select` | 1 | ~100 байт | ~500-1000 нс |
-
-**Когда что:**
-
-- **N < 100** — N горутин (проще).
-- **N > 1000** — `reflect.Select` (меньше горутин).
-
-### Fan-in с context
-
-**Добавим отмену:**
-
-```go
-func fanInReflectCtx(ctx context.Context, channels []<-chan int) <-chan int {
-    out := make(chan int)
-
-    go func() {
-        defer close(out)
-
-        cases := make([]reflect.SelectCase, len(channels)+1)
-        for i, ch := range channels {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
-        }
-        // Добавляем ctx.Done() как case
-        cases[len(channels)] = reflect.SelectCase{
-            Dir:  reflect.SelectRecv,
-            Chan: reflect.ValueOf(ctx.Done()),
-        }
-
-        ctxIdx := len(channels)
-
-        for len(cases) > 1 {
-            i, v, ok := reflect.Select(cases)
-            if i == ctxIdx {
-                // ctx.Done() — отмена
-                return
-            }
-            if !ok {
-                cases = append(cases[:i], cases[i+1:]...)
-                if i < ctxIdx {
-                    ctxIdx--
-                }
-                continue
-            }
-            out <- int(v.Int())
-        }
-    }()
-
-    return out
-}
-```
-
-**Что добавилось:**
-
-- `ctx.Done()` как **дополнительный** case.
-- При срабатывании — выход.
-- Индекс `ctxIdx` корректируется при удалении каналов.
+- **Closed:** считаем ошибки.
+- **Open:** ждём `timeout`.
+- **Half-Open:** пробный запрос.
+  - Успех → Closed.
+  - Ошибка → Open.
 
 ### Полный пример
 
@@ -679,647 +439,750 @@ func fanInReflectCtx(ctx context.Context, channels []<-chan int) <-chan int {
 package main
 
 import (
-    "context"
+    "errors"
     "fmt"
-    "reflect"
+    "sync"
     "time"
 )
 
-func main() {
-    // Создаём N каналов
-    const numChannels = 5
-    channels := make([]<-chan int, numChannels)
+type State int
 
-    for i := 0; i < numChannels; i++ {
-        ch := make(chan int, 10)
-        channels[i] = ch
-        go func(id int, c chan<- int) {
-            defer close(c)
-            for j := 0; j < 3; j++ {
-                c <- id*10 + j
-                time.Sleep(10 * time.Millisecond)
-            }
-        }(i, ch)
-    }
+const (
+    StateClosed State = iota
+    StateOpen
+    StateHalfOpen
+)
 
-    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-    defer cancel()
+var ErrCircuitOpen = errors.New("circuit breaker is open")
 
-    out := fanInReflectCtx(ctx, channels)
-
-    for v := range out {
-        fmt.Println(v)
-    }
-    fmt.Println("done")
+type CircuitBreaker struct {
+    threshold       int
+    timeout         time.Duration
+    failures        int
+    lastFailureTime time.Time
+    state           State
+    mu              sync.Mutex
 }
 
-func fanInReflectCtx(ctx context.Context, channels []<-chan int) <-chan int {
-    out := make(chan int)
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+    return &CircuitBreaker{
+        threshold: threshold,
+        timeout:   timeout,
+        state:     StateClosed,
+    }
+}
 
-    go func() {
-        defer close(out)
+func (b *CircuitBreaker) Call(fn func() error) error {
+    if err := b.beforeCall(); err != nil {
+        return err
+    }
+    
+    err := fn()
+    b.afterCall(err)
+    return err
+}
 
-        cases := make([]reflect.SelectCase, len(channels)+1)
-        for i, ch := range channels {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
+func (b *CircuitBreaker) beforeCall() error {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    switch b.state {
+    case StateClosed:
+        return nil
+    case StateOpen:
+        if time.Since(b.lastFailureTime) > b.timeout {
+            b.state = StateHalfOpen
+            return nil
         }
-        cases[len(channels)] = reflect.SelectCase{
-            Dir:  reflect.SelectRecv,
-            Chan: reflect.ValueOf(ctx.Done()),
-        }
-        ctxIdx := len(channels)
+        return ErrCircuitOpen
+    case StateHalfOpen:
+        return nil
+    }
+    return nil
+}
 
-        for len(cases) > 1 {
-            i, v, ok := reflect.Select(cases)
-            if i == ctxIdx {
-                return
-            }
-            if !ok {
-                cases = append(cases[:i], cases[i+1:]...)
-                if i < ctxIdx {
-                    ctxIdx--
-                }
-                continue
-            }
-            out <- int(v.Int())
+func (b *CircuitBreaker) afterCall(err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    if err != nil {
+        b.failures++
+        b.lastFailureTime = time.Now()
+        if b.failures >= b.threshold {
+            b.state = StateOpen
         }
-    }()
+        if b.state == StateHalfOpen {
+            b.state = StateOpen
+        }
+    } else {
+        b.failures = 0
+        if b.state == StateHalfOpen {
+            b.state = StateClosed
+        }
+    }
+}
 
-    return out
+func main() {
+    breaker := NewCircuitBreaker(3, 1*time.Second)
+    
+    // Симулируем отказы
+    for i := 0; i < 5; i++ {
+        err := breaker.Call(func() error {
+            return errors.New("service unavailable")
+        })
+        fmt.Printf("[%v] Call %d: %v\n", time.Now().Format("15:04:05.000"), i, err)
+        time.Sleep(200 * time.Millisecond)
+    }
+    
+    // Ждём timeout
+    fmt.Println("waiting for recovery...")
+    time.Sleep(1 * time.Second)
+    
+    // Пробный запрос
+    err := breaker.Call(func() error {
+        return nil  // успех
+    })
+    fmt.Printf("[%v] Recovery: %v\n", time.Now().Format("15:04:05.000"), err)
 }
 ```
 
 **Пример вывода:**
 
 ```
-0
-10
-20
-30
-40
-1
-11
-21
-...
-done
+[12:00:00.000] Call 0: service unavailable
+[12:00:00.200] Call 1: service unavailable
+[12:00:00.400] Call 2: service unavailable
+[12:00:00.600] Call 3: circuit breaker is open
+[12:00:00.800] Call 4: circuit breaker is open
+waiting for recovery...
+[12:00:01.800] Recovery: <nil>
 ```
 
-**Что видно:** значения из всех 5 каналов, вперемешку.
+**Что видно:**
 
-### Аннотация сложности
+- После 3 ошибок — Open.
+- Через 1 секунду — Half-Open.
+- Пробный запрос — успех → Closed.
 
-| Подход | Горутин | Time (per element) |
-|:---|:---|:---|
-| N горутин | N + 1 | ~50-100 нс |
-| `reflect.Select` | 1 | ~500-1000 нс |
-| `reflect.Select` + ctx | 1 | ~500-1000 нс |
+### Схема
 
-### 💡 Практика: как строить динамический fan-in
+```
+StateClosed:                StateOpen:                 StateHalfOpen:
+  errors++                    return ErrCircuitOpen       пробный запрос
+  if errors >= N:             if timeout passed:          ├─ успех → Closed
+    state = Open                state = HalfOpen          └─ ошибка → Open
+```
+
+### 💡 Практика: как настроить threshold и timeout
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **`reflect.Select`** для N > 1000.
-2. **N горутин** для N < 100.
-3. **Удаляй закрытые каналы.**
-4. **`ctx.Done()`** как дополнительный case.
+1. **Threshold 5–10** — для большинства сервисов.
+2. **Timeout 10–60 сек** — время на восстановление.
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-5. **Буферизованный `out`** для снижения contention.
-6. **Логирование** — сколько каналов активно.
+3. **Threshold зависит от RPS.** Если 1000 RPS — 10 ошибок мгновенно. Если 1 RPS — 10 ошибок за 10 сек.
+4. **Timeout зависит от сервиса.** Быстрый рестарт — 10 сек. Долгий — 60 сек.
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не используй `reflect.Select` для 2-3 каналов** — обычный `select` проще.
-8. **Не забывай удалять закрытые каналы.**
-
-### Ключевые выводы подглавы 15.3
-
-- **Динамический fan-in** — слияние N каналов.
-- **N горутин** — для N < 100.
-- **`reflect.Select`** — для N > 1000.
-- **`ctx.Done()`** как дополнительный case.
-- **Удаляй закрытые каналы.**
+5. **Threshold = 1.** Ложные срабатывания.
+6. **Timeout = 1 сек.** Сервис не успеет восстановиться.
 
 ---
 
-## 15.4 Приоритетный select
+## 15.4 Half-Open: пробные запросы
 
-**Приоритетный select** — `select`, где один case имеет **приоритет**.
+**Half-Open** — состояние, в котором мы **пробуем** восстановиться.
+
+### Идея
+
+После `timeout` в Open переходим в Half-Open. Пропускаем **1 пробный** запрос:
+
+- **Успех** → Closed (сервис восстановился).
+- **Ошибка** → Open (всё ещё не работает).
+
+### Проблема: несколько пробных
+
+Если **несколько** горутин видят Half-Open **одновременно** — все делают пробные запросы. Внешний сервис может **упасть снова**.
+
+### Решение: ограничение пробных
+
+Добавим счётчик успехов в Half-Open:
+
+```go
+type CircuitBreaker struct {
+    threshold       int
+    timeout         time.Duration
+    halfOpenMax     int  // сколько пробных в Half-Open
+    failures        int
+    successes       int
+    lastFailureTime time.Time
+    state           State
+    mu              sync.Mutex
+}
+
+func (b *CircuitBreaker) beforeCall() error {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    switch b.state {
+    case StateClosed:
+        return nil
+    case StateOpen:
+        if time.Since(b.lastFailureTime) > b.timeout {
+            b.state = StateHalfOpen
+            b.successes = 0
+            return nil
+        }
+        return ErrCircuitOpen
+    case StateHalfOpen:
+        if b.successes >= b.halfOpenMax {
+            return ErrCircuitOpen  // уже достаточно пробных
+        }
+        return nil
+    }
+    return nil
+}
+
+func (b *CircuitBreaker) afterCall(err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    if err != nil {
+        b.failures++
+        b.lastFailureTime = time.Now()
+        if b.failures >= b.threshold {
+            b.state = StateOpen
+        }
+        if b.state == StateHalfOpen {
+            b.state = StateOpen
+            b.successes = 0
+        }
+    } else {
+        b.failures = 0
+        if b.state == StateHalfOpen {
+            b.successes++
+            if b.successes >= b.halfOpenMax {
+                b.state = StateClosed
+                b.successes = 0
+            }
+        }
+    }
+}
+```
+
+**Что происходит:**
+
+- В Half-Open пропускаем `halfOpenMax` пробных.
+- Если все успешны — Closed.
+- Если хотя бы один упал — Open.
+
+### Схема
+
+```
+StateHalfOpen:
+  successes = 0
+  halfOpenMax = 1
+
+Пробный запрос 1:
+  ├─ Успех → successes = 1 → Closed
+  └─ Ошибка → Open
+
+StateHalfOpen с halfOpenMax = 3:
+  Пробный 1: успех → successes = 1
+  Пробный 2: успех → successes = 2
+  Пробный 3: успех → successes = 3 → Closed
+  
+  Если пробный 2 упал → Open
+```
+
+### Что выбрать
+
+**halfOpenMax = 1:**
+
+- Строгое восстановление.
+- Сервис должен ответить на 1 запрос.
+
+**halfOpenMax = 3:**
+
+- Более надёжно.
+- Нужно 3 успешных подряд.
+
+**halfOpenMax = 5:**
+
+- Для критичных сервисов.
+
+### 💡 Практика: как настроить Half-Open
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`halfOpenMax = 1`** — минимально.
+2. **`halfOpenMax = 3`** — для надёжности.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Сброс `successes` при ошибке.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не пропускай много пробных.**
+5. **Не сбрасывай `successes` при успехе.**
+
+---
+
+## 15.5 Circuit breaker с context
+
+`context` — критичен для circuit breaker. Без него `Call` может **блокироваться навсегда**.
 
 ### Проблема
 
-**Обычный `select` случаен.** Если несколько case'ов готовы, выбирается **случайный** (Глава 2).
-
 ```go
-for {
-    select {
-    case v := <-highPriorityCh:
-        processHigh(v)
-    case v := <-lowPriorityCh:
-        processLow(v)  // ← может голодать
-    }
-}
+err := breaker.Call(func() error {
+    return slowOperation()  // ← может висеть
+})
 ```
 
-**Что происходит:** если `highPriorityCh` всегда готов, `lowPriorityCh` может **голодать**.
+**Что происходит:** если `slowOperation` виснет, `Call` ждёт. Даже если `ctx` отменён.
 
-### Решение: двойной select
-
-**Идея:** сначала проверить **приоритетный** канал, потом — все остальные.
+### Решение: context в Call
 
 ```go
-for {
-    // 1. Проверяем приоритетный канал
+func (b *CircuitBreaker) Call(ctx context.Context, fn func(ctx context.Context) error) error {
+    if err := b.beforeCall(); err != nil {
+        return err
+    }
+    
+    // Проверка context
     select {
-    case v := <-highPriorityCh:
-        processHigh(v)
-        continue
+    case <-ctx.Done():
+        b.afterCall(ctx.Err())
+        return ctx.Err()
     default:
     }
+    
+    err := fn(ctx)
+    b.afterCall(err)
+    return err
+}
+```
 
-    // 2. Если приоритетный не готов — ждём любой
+**Что происходит:**
+
+- `ctx` передаётся в `fn`.
+- `fn` сама проверяет `ctx`.
+- `Call` проверяет `ctx` до вызова.
+
+### Полный пример
+
+```go
+func (b *CircuitBreaker) Call(ctx context.Context, fn func(ctx context.Context) error) error {
+    if err := b.beforeCall(); err != nil {
+        return err
+    }
+    
     select {
-    case v := <-highPriorityCh:
-        processHigh(v)
-    case v := <-lowPriorityCh:
-        processLow(v)
+    case <-ctx.Done():
+        b.afterCall(ctx.Err())
+        return ctx.Err()
+    default:
+    }
+    
+    err := fn(ctx)
+    b.afterCall(err)
+    return err
+}
+```
+
+### Потребитель
+
+```go
+func main() {
+    breaker := NewCircuitBreaker(3, 1*time.Second)
+    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+    defer cancel()
+    
+    err := breaker.Call(ctx, func(ctx context.Context) error {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-time.After(1 * time.Second):
+            return nil
+        }
+    })
+    fmt.Println("error:", err)
+}
+```
+
+**Пример вывода:**
+
+```
+error: context deadline exceeded
+```
+
+**Что происходит:** `ctx` отменён через 500 мс. `fn` возвращает `ctx.Err()`.
+
+### Circuit breaker + context в HTTP-клиенте
+
+```go
+type HTTPClient struct {
+    client  *http.Client
+    breaker *CircuitBreaker
+}
+
+func (c *HTTPClient) Get(ctx context.Context, url string) (*http.Response, error) {
+    var resp *http.Response
+    err := c.breaker.Call(ctx, func(ctx context.Context) error {
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil {
+            return err
+        }
+        var reqErr error
+        resp, reqErr = c.client.Do(req)
+        return reqErr
+    })
+    if err != nil {
+        return nil, err
+    }
+    return resp, nil
+}
+```
+
+### 💡 Практика: как добавить context
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`ctx context.Context` — первый аргумент.**
+2. **`fn(ctx)` — передавай ctx в callback.**
+3. **Проверяй `ctx.Done()` до вызова.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **`afterCall(ctx.Err())` при отмене.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не вызывай `fn` без `ctx`.**
+6. **Не блокируйся навсегда.**
+
+---
+
+## 15.6 gobreaker: production-ready
+
+Для production — используй `github.com/sony/gobreaker`.
+
+### Установка
+
+```bash
+go get github.com/sony/gobreaker
+```
+
+### Создание
+
+```go
+import "github.com/sony/gobreaker"
+
+cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+    Name:        "my-service",
+    MaxRequests: 3,               // пробных в Half-Open
+    Interval:    10 * time.Second, // окно для подсчёта ошибок
+    Timeout:     30 * time.Second, // Open → Half-Open
+    ReadyToTrip: func(counts gobreaker.Counts) bool {
+        return counts.ConsecutiveFailures > 5
+    },
+})
+```
+
+**Параметры:**
+
+- **`Name`** — имя для метрик.
+- **`MaxRequests`** — пробных в Half-Open.
+- **`Interval`** — окно подсчёта ошибок (если 0 — не сбрасывать счётчики).
+- **`Timeout`** — время в Open.
+- **`ReadyToTrip`** — функция, которая решает, когда открывать.
+
+### Использование
+
+```go
+result, err := cb.Execute(func() (interface{}, error) {
+    return http.Get("https://api.example.com")
+})
+```
+
+**Что происходит:** `Execute` вызывает функцию, считает ошибки, переключает состояния.
+
+### Пример
+
+```go
+package main
+
+import (
+    "errors"
+    "fmt"
+    "time"
+    
+    "github.com/sony/gobreaker"
+)
+
+func main() {
+    cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+        Name:        "my-service",
+        MaxRequests: 1,
+        Timeout:     1 * time.Second,
+        ReadyToTrip: func(counts gobreaker.Counts) bool {
+            return counts.ConsecutiveFailures > 3
+        },
+    })
+    
+    for i := 0; i < 10; i++ {
+        _, err := cb.Execute(func() (interface{}, error) {
+            return nil, errors.New("service unavailable")
+        })
+        fmt.Printf("[%v] Call %d: %v (state=%v)\n",
+            time.Now().Format("15:04:05.000"), i, err, cb.State())
+        time.Sleep(200 * time.Millisecond)
     }
 }
 ```
 
-**Что делает:**
+**Пример вывода:**
 
-1. **Первый `select`** с `default` — неблокирующая проверка приоритетного.
-2. Если готов — обрабатываем.
-3. Если нет — **второй `select`** ждёт любой.
-4. Во втором `select` приоритетный всё равно участвует — но уже честно.
+```
+[12:00:00.000] Call 0: service unavailable (state=closed)
+[12:00:00.200] Call 1: service unavailable (state=closed)
+[12:00:00.400] Call 2: service unavailable (state=closed)
+[12:00:00.600] Call 3: service unavailable (state=closed)
+[12:00:00.800] Call 4: circuit breaker is open (state=open)
+[12:00:01.000] Call 5: circuit breaker is open (state=open)
+...
+```
 
-### Альтернатива: weighted random
+### Настройки ReadyToTrip
 
-**Если приоритет не строгий** — можно использовать вероятности:
+**Последовательные ошибки:**
 
 ```go
-for {
-    select {
-    case v := <-highPriorityCh:
-        processHigh(v)
-    case v := <-lowPriorityCh:
-        processLow(v)
-    case <-time.After(100 * time.Millisecond):
-        // Периодически обрабатываем low, даже если high готов
+ReadyToTrip: func(counts gobreaker.Counts) bool {
+    return counts.ConsecutiveFailures > 5
+}
+```
+
+**Процент ошибок:**
+
+```go
+ReadyToTrip: func(counts gobreaker.Counts) bool {
+    failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+    return counts.Requests >= 10 && failureRatio >= 0.6
+}
+```
+
+**Комбинация:**
+
+```go
+ReadyToTrip: func(counts gobreaker.Counts) bool {
+    return counts.ConsecutiveFailures > 5 ||
+        (counts.Requests >= 100 && counts.TotalFailures > 50)
+}
+```
+
+### Сравнение с нашей реализацией
+
+| Аспект | Наш | `gobreaker` |
+|:---|:---|:---|
+| Threshold | Последовательные ошибки | Гибкий |
+| Timeout | ✅ | ✅ |
+| Half-Open | ✅ | ✅ |
+| Метрики | ❌ | ✅ |
+| Гибкость | Ограничена | Высокая |
+| Production-ready | ❌ | ✅ |
+
+**Вывод:** наш circuit breaker — для **понимания**. Для production — `gobreaker`.
+
+### 💡 Практика: как использовать gobreaker
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`gobreaker.NewCircuitBreaker`** для production.
+2. **`ReadyToTrip`** — настрой под свой сервис.
+3. **`Timeout` 30–60 сек.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Метрики из `cb.State()`.**
+5. **Логирование переходов.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не используй свою реализацию в production.**
+7. **Не забывай про `Interval`.**
+
+---
+
+## 15.7 В связке с другими паттернами
+
+Circuit breaker редко используется **в одиночку**. Разберём связки.
+
+### Circuit breaker + retry
+
+**Retry** повторяет неудачные операции. **Circuit breaker** прекращает вызовы.
+
+```go
+func fetchWithRetryAndBreaker(ctx context.Context, cb *CircuitBreaker, url string) (*http.Response, error) {
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        var resp *http.Response
+        err := cb.Call(ctx, func(ctx context.Context) error {
+            req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+            if err != nil {
+                return err
+            }
+            var reqErr error
+            resp, reqErr = http.DefaultClient.Do(req)
+            return reqErr
+        })
+        if err == nil {
+            return resp, nil
+        }
+        if errors.Is(err, ErrCircuitOpen) {
+            return nil, err  // не retry
+        }
+        lastErr = err
+        
+        // Backoff
         select {
-        case v := <-lowPriorityCh:
-            processLow(v)
-        default:
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
         }
     }
+    return nil, lastErr
 }
 ```
 
-**Что делает:** раз в 100 мс даёт шанс `lowPriorityCh`.
+**Что происходит:**
 
-### Паттерн: три уровня приоритета
+- Retry до 3 раз.
+- Circuit breaker между попытками.
+- Если breaker открыт — не retry.
+
+### Circuit breaker + rate limiter
+
+**Rate limiter** ограничивает скорость. **Circuit breaker** защищает от сбоев.
 
 ```go
-func processWithPriority(high, medium, low <-chan int) {
+type HTTPClient struct {
+    client  *http.Client
+    limiter *rate.Limiter
+    breaker *CircuitBreaker
+}
+
+func (c *HTTPClient) Get(ctx context.Context, url string) (*http.Response, error) {
+    // 1. Rate limiter
+    if err := c.limiter.Wait(ctx); err != nil {
+        return nil, err
+    }
+    
+    // 2. Circuit breaker
+    var resp *http.Response
+    err := c.breaker.Call(ctx, func(ctx context.Context) error {
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil {
+            return err
+        }
+        var reqErr error
+        resp, reqErr = c.client.Do(req)
+        return reqErr
+    })
+    if err != nil {
+        return nil, err
+    }
+    return resp, nil
+}
+```
+
+**Порядок:**
+
+1. **Rate limiter** — первым.
+2. **Circuit breaker** — вторым.
+
+**Почему:** rate limiter не тратит ресурсы, если breaker открыт.
+
+### Circuit breaker + worker pool
+
+**Worker pool** обрабатывает задачи. **Circuit breaker** защищает внешние вызовы.
+
+```go
+func worker(ctx context.Context, tasksCh <-chan Task, breaker *CircuitBreaker) {
     for {
-        // 1. High
         select {
-        case v := <-high:
-            processHigh(v)
-            continue
-        default:
-        }
-
-        // 2. Medium
-        select {
-        case v := <-high:
-            processHigh(v)
-            continue
-        case v := <-medium:
-            processMedium(v)
-            continue
-        default:
-        }
-
-        // 3. Low (блокирующий)
-        select {
-        case v := <-high:
-            processHigh(v)
-        case v := <-medium:
-            processMedium(v)
-        case v := <-low:
-            processLow(v)
+        case <-ctx.Done():
+            return
+        case task, ok := <-tasksCh:
+            if !ok {
+                return
+            }
+            err := breaker.Call(ctx, func(ctx context.Context) error {
+                return process(ctx, task)
+            })
+            if err != nil {
+                if errors.Is(err, ErrCircuitOpen) {
+                    // breaker открыт — пропускаем задачу или ждём
+                }
+                continue
+            }
         }
     }
 }
 ```
 
-**Что делает:**
+### Схема: полная защита
 
-1. High — проверяется первым.
-2. Medium — если high нет.
-3. Low — если ни high, ни medium нет.
-4. Но low **всё равно** может сработать, если high/medium не готовы.
-
-### Starvation в приоритетном select
-
-**Проблема:** если high **всегда** готов, low **никогда** не обработается.
-
-**Решение:** **weighted** или **периодический** доступ.
-
-```go
-for i := 0; ; i++ {
-    // Каждые 100 итераций — обрабатываем low
-    if i%100 == 0 {
-        select {
-        case v := <-low:
-            processLow(v)
-            continue
-        default:
-        }
-    }
-
-    select {
-    case v := <-high:
-        processHigh(v)
-    case v := <-low:
-        processLow(v)
-    }
-}
+```
+Запрос
+   │
+   ▼
+┌──────────────┐
+│ Rate limiter │  ← не более RPS
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Circuit    │  ← защита от сбоев
+│   breaker    │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│    Retry     │  ← повтор при временных ошибках
+└──────┬───────┘
+       │
+       ▼
+     HTTP
 ```
 
-### Аннотация сложности
-
-| Подход | Time |
-|:---|:---|
-| Обычный select | ~100-200 нс |
-| Двойной select | ~200-400 нс |
-| Weighted random | ~200-400 нс |
-
-### 💡 Практика: как строить приоритетный select
+### 💡 Практика: как комбинировать circuit breaker
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Двойной select** — для строгого приоритета.
-2. **Weighted random** — для мягкого.
-3. **Периодический доступ** — против starvation.
+1. **Circuit breaker + retry** — полная защита.
+2. **Rate limiter → circuit breaker → retry → HTTP.**
+3. **Circuit breaker + worker pool** — для внешних вызовов.
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **Метрики** — сколько из каждого канала.
+4. **Разные circuit breaker для разных сервисов.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-5. **Не полагайся на порядок в `select`** — он случаен.
-6. **Не делай строгий приоритет без периодического low.**
-
-### Ключевые выводы подглавы 15.4
-
-- **`select` случаен** — нет приоритетов.
-- **Двойной select** — для строгого приоритета.
-- **Weighted random** — для мягкого.
-- **Периодический доступ** — против starvation.
+5. **Не retry при открытом breaker.**
+6. **Не забывай про порядок.**
 
 ---
 
-## 15.5 Starvation в select и как его избежать
+## 15.8 Практика Go: circuit breaker с метриками
 
-**Starvation** — один канал **никогда** не обрабатывается.
-
-### Причины
-
-**1. Готовый канал всегда есть.**
-
-```go
-for {
-    select {
-    case v := <-fastCh:  // ← всегда готов
-        process(v)
-    case v := <-slowCh:  // ← голодает
-        process(v)
-    }
-}
-```
-
-**Что происходит:** `fastCh` всегда готов, `select` его выбирает. `slowCh` голодает.
-
-**2. Приоритет без периодического доступа.**
-
-См. 15.4.
-
-**3. Голодание в `reflect.Select`.**
-
-```go
-for len(cases) > 0 {
-    i, v, ok := reflect.Select(cases)
-    // ...
-}
-```
-
-`reflect.Select` тоже **случаен** — starvation маловероятен, но возможен.
-
-### Как обнаружить
-
-**1. Метрики по каналам.**
-
-```go
-var metrics = map[string]atomic.Int64{
-    "fast": {},
-    "slow": {},
-}
-
-for {
-    select {
-    case v := <-fastCh:
-        metrics["fast"].Add(1)
-    case v := <-slowCh:
-        metrics["slow"].Add(1)
-    }
-}
-```
-
-**Что искать:** один канал **резко** отстаёт.
-
-**2. Логирование.**
-
-```go
-select {
-case v := <-fastCh:
-    log.Println("fast")
-case v := <-slowCh:
-    log.Println("slow")
-}
-```
-
-**Что искать:** один канал не появляется в логах.
-
-### Как избежать
-
-**1. Weighted random.**
-
-```go
-for {
-    select {
-    case v := <-fastCh:
-        process(v)
-    case v := <-slowCh:
-        process(v)
-    }
-    // ...
-}
-```
-
-**Проблема:** Go `select` случаен, но **не weighted**. Оба канала равны.
-
-**2. Round-robin.**
-
-```go
-channels := []<-chan int{fastCh, slowCh}
-i := 0
-
-for {
-    select {
-    case v := <-channels[i]:
-        process(v)
-    }
-    i = (i + 1) % len(channels)
-}
-```
-
-**Проблема:** если канал не готов — блокировка.
-
-**3. Периодический доступ.**
-
-```go
-for i := 0; ; i++ {
-    if i%10 == 0 {
-        // Каждые 10 итераций — slow
-        select {
-        case v := <-slowCh:
-            process(v)
-            continue
-        default:
-        }
-    }
-
-    select {
-    case v := <-fastCh:
-        process(v)
-    case v := <-slowCh:
-        process(v)
-    }
-}
-```
-
-**Что делает:** раз в 10 итераций — попытка slow.
-
-**4. Разные горутины.**
-
-```go
-go func() {
-    for v := range fastCh {
-        process(v)
-    }
-}()
-
-go func() {
-    for v := range slowCh {
-        process(v)
-    }
-}()
-```
-
-**Что делает:** каждый канал обрабатывается **своей** горутиной. Starvation **невозможен**.
-
-**Минус:** contention на общих ресурсах.
-
-### Сравнение
-
-| Подход | Starvation | Contention |
-|:---|:---|:---|
-| Обычный select | Возможен | Низкий |
-| Двойной select | Возможен | Низкий |
-| Периодический | Маловероятен | Низкий |
-| Разные горутины | Невозможен | Высокий |
-
-### Аннотация сложности
-
-| Подход | Time |
-|:---|:---|
-| Обычный select | ~100-200 нс |
-| Периодический | ~200-400 нс |
-| Разные горутины | ~100-200 нс + contention |
-
-### 💡 Практика: как избежать starvation
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Метрики** по каналам.
-2. **Периодический доступ** к голодающим.
-3. **Разные горутины** для независимых каналов.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Алерты** на starvation.
-5. **Round-robin** для справедливости.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не полагайся на случайность `select`.**
-7. **Не игнорируй отстающий канал.**
-
-### Ключевые выводы подглавы 15.5
-
-- **Starvation** — один канал голодает.
-- **Причины:** готовый канал всегда есть, приоритет без периодичности.
-- **Обнаружение:** метрики, логирование.
-- **Решение:** периодический доступ, разные горутины.
-
----
-
-## 15.6 Производительность: reflect.Select vs N горутин
-
-Разберём **производительность**.
-
-### Бенчмарк
-
-```go
-func BenchmarkFanInGoroutines(b *testing.B) {
-    channels := make([]<-chan int, 100)
-    for i := range channels {
-        ch := make(chan int, b.N)
-        channels[i] = ch
-        for j := 0; j < b.N; j++ {
-            ch <- j
-        }
-        close(ch)
-    }
-
-    b.ResetTimer()
-    out := fanInGoroutines(channels)
-    count := 0
-    for range out {
-        count++
-    }
-}
-
-func BenchmarkFanInReflect(b *testing.B) {
-    channels := make([]<-chan int, 100)
-    for i := range channels {
-        ch := make(chan int, b.N)
-        channels[i] = ch
-        for j := 0; j < b.N; j++ {
-            ch <- j
-        }
-        close(ch)
-    }
-
-    b.ResetTimer()
-    out := fanInReflect(channels)
-    count := 0
-    for range out {
-        count++
-    }
-}
-```
-
-### Пример вывода
-
-```
-BenchmarkFanInGoroutines-8    1000    1234567 ns/op
-BenchmarkFanInReflect-8       1000    5678901 ns/op
-```
-
-**Что видно:** `reflect.Select` **в 5 раз медленнее** для 100 каналов.
-
-### Когда `reflect.Select` быстрее
-
-**1. Очень много каналов (1000+).**
-
-N горутин = 1001 горутина. Планировщик тратит время на переключение.
-
-`reflect.Select` = 1 горутина. Планировщик не тратит время.
-
-**2. Мало данных.**
-
-Если данных мало, N горутин **создаются и уничтожаются** — overhead.
-
-`reflect.Select` = 1 горутина на всё время.
-
-**3. Много памяти.**
-
-N горутин = N × 2.3 КБ. Для 10 000 каналов — 23 МБ.
-
-`reflect.Select` = ~100 байт на case. Для 10 000 — 1 МБ.
-
-### Когда N горутин быстрее
-
-**1. Мало каналов (< 100).**
-
-N горутин = 3-100. Overhead минимален.
-
-`reflect.Select` = 500-1000 нс на элемент. Дорого.
-
-**2. Много данных.**
-
-N горутин обрабатывают **параллельно**. `reflect.Select` — **последовательно**.
-
-**3. Простой код.**
-
-N горутин — просто. `reflect.Select` — сложно.
-
-### Сравнение
-
-| N каналов | N горутин | reflect.Select |
-|:---|:---|:---|
-| 2-10 | Быстрее | Медленнее |
-| 100 | Быстрее | Медленнее |
-| 1000 | Сравнимо | Сравнимо |
-| 10000 | Медленнее (память) | Быстрее |
-
-### Аннотация сложности
-
-| N | N горутин | reflect.Select |
-|:---|:---|:---|
-| 10 | ~50-100 нс | ~500-1000 нс |
-| 100 | ~50-100 нс | ~500-1000 нс |
-| 1000 | ~100-200 нс | ~500-1000 нс |
-| 10000 | ~1-2 мкс + 23 МБ | ~500-1000 нс + 1 МБ |
-
-### 💡 Практика: как выбирать
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **N < 100** — N горутин.
-2. **N > 1000** — `reflect.Select`.
-3. **Бенчмаркай** для своего случая.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Метрики** — сколько времени тратится.
-
-**❌ НЕ ДЕЛАЙ:**
-
-5. **Не используй `reflect.Select` для 2-3 каналов.**
-6. **Не создавай 10 000 горутин.**
-
-### Ключевые выводы подглавы 15.6
-
-- **`reflect.Select`** медленнее для малых N.
-- **N горутин** медленнее для больших N (память).
-- **Порог:** ~100-1000 каналов.
-- **Бенчмаркай** для своего случая.
-
----
-
-## 15.7 Практика Go: динамический fan-in с метриками
-
-Напишем **динамический fan-in** с метриками.
+Разберём **circuit breaker с метриками**.
 
 ### Полный код
 
@@ -1328,346 +1191,394 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
-    "reflect"
+    "sync"
     "sync/atomic"
     "time"
 )
 
+type State int
+
+const (
+    StateClosed State = iota
+    StateOpen
+    StateHalfOpen
+)
+
+func (s State) String() string {
+    switch s {
+    case StateClosed:
+        return "closed"
+    case StateOpen:
+        return "open"
+    case StateHalfOpen:
+        return "half-open"
+    }
+    return "unknown"
+}
+
+var ErrCircuitOpen = errors.New("circuit breaker is open")
+
 type Metrics struct {
-    Received atomic.Int64
-    Active   atomic.Int64
-    Closed   atomic.Int64
+    Requests      atomic.Int64
+    Successes     atomic.Int64
+    Failures      atomic.Int64
+    Rejected      atomic.Int64
+    StateChanges  atomic.Int64
+}
+
+type CircuitBreaker struct {
+    threshold       int
+    timeout         time.Duration
+    halfOpenMax     int
+    failures        int
+    successes       int
+    lastFailureTime time.Time
+    state           State
+    mu              sync.Mutex
+    metrics         *Metrics
+}
+
+func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
+    return &CircuitBreaker{
+        threshold:   threshold,
+        timeout:     timeout,
+        halfOpenMax: 1,
+        state:       StateClosed,
+        metrics:     &Metrics{},
+    }
+}
+
+func (b *CircuitBreaker) Call(ctx context.Context, fn func(ctx context.Context) error) error {
+    b.metrics.Requests.Add(1)
+    
+    if err := b.beforeCall(); err != nil {
+        b.metrics.Rejected.Add(1)
+        return err
+    }
+    
+    select {
+    case <-ctx.Done():
+        b.afterCall(ctx.Err())
+        return ctx.Err()
+    default:
+    }
+    
+    err := fn(ctx)
+    b.afterCall(err)
+    return err
+}
+
+func (b *CircuitBreaker) beforeCall() error {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    switch b.state {
+    case StateClosed:
+        return nil
+    case StateOpen:
+        if time.Since(b.lastFailureTime) > b.timeout {
+            b.setState(StateHalfOpen)
+            b.successes = 0
+            return nil
+        }
+        return ErrCircuitOpen
+    case StateHalfOpen:
+        if b.successes >= b.halfOpenMax {
+            return ErrCircuitOpen
+        }
+        return nil
+    }
+    return nil
+}
+
+func (b *CircuitBreaker) afterCall(err error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    if err != nil {
+        b.metrics.Failures.Add(1)
+        b.failures++
+        b.lastFailureTime = time.Now()
+        
+        if b.failures >= b.threshold {
+            b.setState(StateOpen)
+        }
+        if b.state == StateHalfOpen {
+            b.setState(StateOpen)
+            b.successes = 0
+        }
+    } else {
+        b.metrics.Successes.Add(1)
+        b.failures = 0
+        if b.state == StateHalfOpen {
+            b.successes++
+            if b.successes >= b.halfOpenMax {
+                b.setState(StateClosed)
+                b.successes = 0
+            }
+        }
+    }
+}
+
+func (b *CircuitBreaker) setState(s State) {
+    if b.state != s {
+        b.state = s
+        b.metrics.StateChanges.Add(1)
+        fmt.Printf("[%v] State changed: %v\n", time.Now().Format("15:04:05.000"), s)
+    }
+}
+
+func (b *CircuitBreaker) State() State {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    return b.state
 }
 
 func main() {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
-    // Создаём 10 каналов
-    const numChannels = 10
-    channels := make([]<-chan int, numChannels)
-
-    for i := 0; i < numChannels; i++ {
-        ch := make(chan int, 100)
-        channels[i] = ch
-        go producer(ctx, i, ch)
+    breaker := NewCircuitBreaker(3, 1*time.Second)
+    ctx := context.Background()
+    
+    // Фаза 1: отказы
+    for i := 0; i < 5; i++ {
+        err := breaker.Call(ctx, func(ctx context.Context) error {
+            return errors.New("service unavailable")
+        })
+        fmt.Printf("Call %d: %v\n", i, err)
+        time.Sleep(100 * time.Millisecond)
     }
-
-    var metrics Metrics
-    metrics.Active.Store(int64(numChannels))
-
-    out := fanInReflect(ctx, channels, &metrics)
-
-    for v := range out {
-        _ = v
-    }
-
-    fmt.Printf("Received: %d\n", metrics.Received.Load())
-    fmt.Printf("Active:   %d\n", metrics.Active.Load())
-    fmt.Printf("Closed:   %d\n", metrics.Closed.Load())
-}
-
-func producer(ctx context.Context, id int, ch chan<- int) {
-    defer close(ch)
-    for i := 0; i < 10; i++ {
-        select {
-        case ch <- id*100 + i:
-            time.Sleep(10 * time.Millisecond)
-        case <-ctx.Done():
-            return
-        }
-    }
-}
-
-func fanInReflect(ctx context.Context, channels []<-chan int, metrics *Metrics) <-chan int {
-    out := make(chan int, 100)
-
-    go func() {
-        defer close(out)
-
-        cases := make([]reflect.SelectCase, len(channels)+1)
-        for i, ch := range channels {
-            cases[i] = reflect.SelectCase{
-                Dir:  reflect.SelectRecv,
-                Chan: reflect.ValueOf(ch),
-            }
-        }
-        ctxIdx := len(channels)
-        cases[ctxIdx] = reflect.SelectCase{
-            Dir:  reflect.SelectRecv,
-            Chan: reflect.ValueOf(ctx.Done()),
-        }
-
-        for len(cases) > 1 {
-            i, v, ok := reflect.Select(cases)
-            if i == ctxIdx {
-                return
-            }
-            if !ok {
-                cases = append(cases[:i], cases[i+1:]...)
-                if i < ctxIdx {
-                    ctxIdx--
-                }
-                metrics.Active.Add(-1)
-                metrics.Closed.Add(1)
-                continue
-            }
-            metrics.Received.Add(1)
-            out <- int(v.Int())
-        }
-    }()
-
-    return out
+    
+    // Фаза 2: ждём восстановления
+    fmt.Println("waiting...")
+    time.Sleep(1 * time.Second)
+    
+    // Фаза 3: восстановление
+    err := breaker.Call(ctx, func(ctx context.Context) error {
+        return nil
+    })
+    fmt.Printf("Recovery: %v\n", err)
+    
+    // Метрики
+    fmt.Println("\n=== Metrics ===")
+    fmt.Printf("Requests:     %d\n", breaker.metrics.Requests.Load())
+    fmt.Printf("Successes:    %d\n", breaker.metrics.Successes.Load())
+    fmt.Printf("Failures:     %d\n", breaker.metrics.Failures.Load())
+    fmt.Printf("Rejected:     %d\n", breaker.metrics.Rejected.Load())
+    fmt.Printf("StateChanges: %d\n", breaker.metrics.StateChanges.Load())
 }
 ```
 
-### Пример вывода
+**Пример вывода:**
 
 ```
-Received: 100
-Active:   0
-Closed:   10
+[12:00:00.000] State changed: open
+Call 0: service unavailable
+Call 1: service unavailable
+Call 2: service unavailable
+[12:00:00.300] State changed: open
+Call 3: circuit breaker is open
+Call 4: circuit breaker is open
+waiting...
+[12:00:01.400] State changed: half-open
+[12:00:01.400] State changed: closed
+Recovery: <nil>
+
+=== Metrics ===
+Requests:     6
+Successes:    1
+Failures:     3
+Rejected:     2
+StateChanges: 3
 ```
 
-**Что видно:**
+### Что демонстрирует
 
-- 100 сообщений получено.
-- 10 каналов закрыто.
-- 0 активных.
+1. **3 состояния** с переходами.
+2. **Метрики:** requests, successes, failures, rejected, stateChanges.
+3. **Логирование** переходов.
+4. **Восстановление** через Half-Open.
 
-### Аннотация сложности
-
-| Метрика | Как измеряется |
-|:---|:---|
-| Received | `atomic.Int64` |
-| Active | `atomic.Int64` |
-| Closed | `atomic.Int64` |
-
-### 💡 Практика: как измерять fan-in
+### 💡 Практика: как измерять circuit breaker
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Received** — сколько получено.
-2. **Active** — сколько каналов активно.
-3. **Closed** — сколько закрыто.
+1. **Метрики:** requests, successes, failures, rejected.
+2. **State changes.**
+3. **Логирование переходов.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
 4. **Экспорт в Prometheus.**
-5. **Алерты** на аномалии.
+5. **Алерт при частых открытиях.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-6. **Не используй `Mutex` для метрик.**
-
-### Ключевые выводы подглавы 15.7
-
-- **Received, Active, Closed** — основные метрики.
-- **`atomic.Int64`** — для счётчиков.
-- **Экспорт в Prometheus** — для production.
+6. **Не игнорируй circuit breaker в метриках.**
+7. **Не забывай про логирование.**
 
 ---
 
-## 15.8 Выводы и типичные ошибки
+## 15.9 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-`select` фиксирован на этапе компиляции. Для динамических каналов — `reflect.Select`. `reflect.SelectCase` — case для каждого канала. `SelectRecv`, `SelectSend`, `SelectDefault` — три типа. Динамический fan-in: N горутин для малых N, `reflect.Select` для больших. Приоритетный select через двойной `select`. Starvation возможен в приоритетном select. `reflect.Select` медленнее обычного `select` в 5-10 раз, но экономит память для больших N.
+Circuit breaker — паттерн для защиты от каскадных отказов. **Три состояния:** Closed (пропускает), Open (отклоняет), Half-Open (пробные запросы). **Threshold** — число ошибок до открытия. **Timeout** — время в Open. **Half-Open** — 1–3 пробных запроса. **`context`** — для отмены. **`gobreaker`** — production-ready. Circuit breaker комбинируется с retry, rate limiter, worker pool.
 
 **Типичные ошибки:**
 
-- ❌ **Пытаться использовать `select` с индексами.** Не работает.
-- ❌ **Забыть удалить закрытый канал** из `cases`. Бесконечный цикл.
-- ❌ **Использовать `reflect.Select` для 2-3 каналов.** Медленнее.
-- ❌ **Создавать 10 000 горутин** для 10 000 каналов.
-- ❌ **Полагать, что `select` даёт приоритет.** Он случаен.
-- ❌ **Не использовать `ctx.Done()`** в `reflect.Select`.
-- ❌ **Игнорировать starvation.**
-- ❌ **Не бенчмаркать** `reflect.Select` vs N горутин.
-- ❌ **Забыть про `reflect.ValueOf(ch)`.** Паника.
-- ❌ **Не проверять `ok`** после `reflect.Select`.
+- ❌ **Threshold = 1.** Ложные срабатывания.
+- ❌ **Timeout = 1 сек.** Сервис не восстановится.
+- ❌ **Не использовать Half-Open.** Breaker не восстановится.
+- ❌ **Блокироваться на `Call` без `ctx`.**
+- ❌ **Retry при открытом breaker.**
+- ❌ **Circuit breaker для внутренних операций.**
+- ❌ **Не мониторить состояние.**
+- ❌ **Не логировать переходы.**
+- ❌ **Использовать свою реализацию в production.**
+- ❌ **Один breaker на все сервисы.**
 
 ---
 
-## 15.9 Для быстрого повторения
+## 15.10 Для быстрого повторения
 
-- **`select` фиксирован** на этапе компиляции.
-- **`reflect.Select`** — динамический `select`.
-- **`SelectCase`** — case для каждого канала.
-- **Три типа:** `SelectRecv`, `SelectSend`, `SelectDefault`.
-- **Динамический fan-in:** N горутин для N < 100, `reflect.Select` для N > 1000.
-- **Приоритетный select** — двойной `select`.
-- **Starvation** — один канал голодает.
-- **`reflect.Select`** медленнее в 5-10 раз, но экономит память.
-- **Порог:** ~100-1000 каналов.
-- **`ctx.Done()`** как дополнительный case.
-- **Удаляй закрытые каналы** из `cases`.
-
----
-
-## 15.10 Вопросы для самопроверки
-
-1. Почему `select` не работает с динамическими каналами?
-2. Что такое `reflect.Select`?
-3. Какие три типа `SelectCase`?
-4. Как удалить закрытый канал из `cases`?
-5. Что такое динамический fan-in?
-6. Когда N горутин, когда `reflect.Select`?
-7. Что такое приоритетный select?
-8. Как построить приоритетный select?
-9. Что такое starvation в select?
-10. Как избежать starvation?
-11. Насколько `reflect.Select` медленнее обычного `select`?
-12. Когда `reflect.Select` быстрее N горутин?
-13. Как добавить `ctx.Done()` в `reflect.Select`?
-14. Какие метрики для fan-in?
-15. Почему `ch = nil` отключает case?
-16. Что произойдёт, если не удалить закрытый канал?
-17. Почему `reflect.ValueOf(ch)` нужен?
-18. Что вернёт `reflect.Select` при закрытом канале?
+- **Circuit breaker** — защита от каскадных отказов.
+- **Три состояния:** Closed, Open, Half-Open.
+- **Closed:** пропускает. **Open:** отклоняет. **Half-Open:** пробные.
+- **Threshold 5–10** — ошибок до открытия.
+- **Timeout 10–60 сек** — время в Open.
+- **Half-Open max 1–3** — пробных запросов.
+- **`context`** — для отмены.
+- **`ErrCircuitOpen`** — ошибка.
+- **`gobreaker`** — production-ready.
+- **Circuit breaker + retry** — полная защита.
+- **Rate limiter → circuit breaker → retry → HTTP.**
+- **Метрики:** requests, successes, failures, rejected, stateChanges.
 
 ---
 
-## 15.11 Ответы
+## 15.11 Вопросы для самопроверки
+
+1. Что такое circuit breaker? Какую задачу решает?
+2. Назови три состояния.
+3. Что такое threshold и timeout?
+4. Что такое Half-Open?
+5. Зачем `context` в circuit breaker?
+6. Как комбинировать circuit breaker с retry?
+7. Что будет, если не использовать Half-Open?
+8. Как использовать `gobreaker`?
+
+---
+
+## 15.12 Ответы
 
 ### Ответ 1
 
-**`select` не работает с динамическими каналами**, потому что компилятор должен знать **все** case'ы на этапе компиляции. Индексы и переменные в case'ах не поддерживаются.
+**Circuit breaker** — паттерн для защиты от каскадных отказов. **Прекращает** вызовы к сломанному сервису. Не ждёт таймаут, а **сразу возвращает ошибку**.
+
+**Когда:** внешние сервисы с медленными или частыми отказами.
 
 ### Ответ 2
 
-**`reflect.Select`** — динамический аналог `select`, который принимает **слайс** case'ов и возвращает индекс готового.
+**Три состояния:**
+1. **Closed** — пропускает запросы.
+2. **Open** — отклоняет запросы немедленно.
+3. **Half-Open** — пропускает пробные запросы.
 
 ### Ответ 3
 
-**Три типа:**
-1. `SelectRecv` — получение.
-2. `SelectSend` — отправка.
-3. `SelectDefault` — default.
+**Threshold** — число ошибок до открытия. 5–10 для большинства.
+
+**Timeout** — время в Open до перехода в Half-Open. 10–60 сек.
 
 ### Ответ 4
 
-**Удалить закрытый канал:**
+**Half-Open** — состояние после timeout в Open. Пропускает **1–3 пробных** запроса:
+- **Успех** → Closed.
+- **Ошибка** → Open.
 
-```go
-cases = append(cases[:i], cases[i+1:]...)
-```
+**Зачем:** проверить, восстановился ли сервис.
 
 ### Ответ 5
 
-**Динамический fan-in** — слияние переменного числа каналов в один.
+**`context`** позволяет не блокироваться навсегда, если `fn` виснет. Без него `Call` может ждать бесконечно.
+
+**Решение:** `ctx` — первый аргумент, `fn(ctx)`.
 
 ### Ответ 6
 
-- **N < 100** — N горутин.
-- **N > 1000** — `reflect.Select`.
+**Circuit breaker + retry:**
+
+```go
+for attempt := 0; attempt < 3; attempt++ {
+    err := breaker.Call(ctx, func(ctx context.Context) error {
+        return http.Get(url)
+    })
+    if err == nil {
+        return nil
+    }
+    if errors.Is(err, ErrCircuitOpen) {
+        return err  // не retry
+    }
+    time.Sleep(backoff(attempt))
+}
+```
+
+Retry до N раз, но не при открытом breaker.
 
 ### Ответ 7
 
-**Приоритетный select** — `select`, где один case имеет приоритет.
+**Без Half-Open:** breaker останется Open **навсегда**. Даже если сервис восстановился — все запросы отклоняются.
+
+**С Half-Open:** периодически пробуем восстановиться.
 
 ### Ответ 8
 
-**Двойной select:**
-
 ```go
-select {
-case v := <-high:
-    process(v)
-    continue
-default:
-}
+cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+    Name:        "my-service",
+    MaxRequests: 3,
+    Timeout:     30 * time.Second,
+    ReadyToTrip: func(counts gobreaker.Counts) bool {
+        return counts.ConsecutiveFailures > 5
+    },
+})
 
-select {
-case v := <-high:
-    process(v)
-case v := <-low:
-    process(v)
-}
+result, err := cb.Execute(func() (interface{}, error) {
+    return http.Get("https://api.example.com")
+})
 ```
-
-### Ответ 9
-
-**Starvation** — один канал никогда не обрабатывается.
-
-### Ответ 10
-
-**Избежать:**
-- Периодический доступ к голодающим.
-- Разные горутины для независимых каналов.
-- Weighted random.
-
-### Ответ 11
-
-**`reflect.Select` медленнее в 5-10 раз** для малых N.
-
-### Ответ 12
-
-**`reflect.Select` быстрее** для N > 1000 из-за экономии памяти и горутин.
-
-### Ответ 13
-
-**Добавить `ctx.Done()`:**
-
-```go
-cases[len(channels)] = reflect.SelectCase{
-    Dir:  reflect.SelectRecv,
-    Chan: reflect.ValueOf(ctx.Done()),
-}
-```
-
-### Ответ 14
-
-**Метрики:** received, active, closed.
-
-### Ответ 15
-
-**`ch = nil`** отключает case, потому что приём из nil-канала блокируется навсегда, и `select` игнорирует этот case.
-
-### Ответ 16
-
-**Бесконечный цикл** — закрытый канал всегда готов (возвращает zero, false).
-
-### Ответ 17
-
-**`reflect.ValueOf(ch)`** нужен для обёртки канала в `reflect.Value`, потому что `SelectCase.Chan` — это `reflect.Value`.
-
-### Ответ 18
-
-**При закрытом канале** `reflect.Select` вернёт `i` этого канала, `recv` = zero Value, `recvOK` = `false`.
 
 ---
 
-## 15.12 Куда идти дальше?
+## 15.13 Куда идти дальше?
 
-Мы разобрали `reflect.Select`, динамический fan-in, приоритетный select, starvation. Теперь мы умеем работать с динамическими каналами.
+Мы разобрали circuit breaker — защиту от каскадных отказов. Теперь мы умеем не рушить свой сервис чужими проблемами.
 
-Но остаётся **следующая тема**: как уменьшить contention через **шардирование** и как писать **lock-free структуры**?
+Но иногда временные ошибки **стоит** повторить. Как это делать правильно?
 
-- **Как уменьшить contention?** Sharded locks, lock-free stack, lock-free queue. → **Глава 16: Sharded locks и lock-free структуры.**
-- **Как переиспользовать объекты?** `sync.Pool`, аллокатор памяти. → **Глава 17: sync.Pool и аллокатор памяти.**
-- **Как GC влияет на конкурентный код?** Tri-color, write barrier, STW паузы. → **Глава 18: GC и его влияние на конкурентный код.**
+- **Как повторять неудачные операции?** → **Глава 16: Retry.**
+- **Как ограничить время операции?** → **Глава 17: Timeout.**
+- **Как ограничить частоту операций?** → **Глава 18: Debounce и Throttle.**
 
 ---
 
-## 15.13 Чек-лист
+## 15.14 Чек-лист
 
 | Компонент | Что это | Ключевые факты |
 |:---|:---|:---|
-| **`select`** | Мультиплексирование | Фиксированный набор case'ов |
-| **`reflect.Select`** | Динамический select | Слайс case'ов |
-| **`SelectCase`** | Case | Dir, Chan, Send |
-| **`SelectRecv`** | Получение | Dir для recv |
-| **`SelectSend`** | Отправка | Dir для send |
-| **`SelectDefault`** | Default | Dir для default |
-| **Динамический fan-in** | N каналов в один | N горутин или reflect |
-| **N горутин** | Для N < 100 | Просто, но много горутин |
-| **`reflect.Select`** | Для N > 1000 | Одна горутина |
-| **Приоритетный select** | Двойной select | Проверка high → любой |
-| **Starvation** | Один канал голодает | Периодический доступ |
-| **`ctx.Done()` в reflect** | Дополнительный case | Для отмены |
-| **Удаление закрытых** | `append(cases[:i], cases[i+1:]...)` | Обязательно |
-| **Метрики** | received, active, closed | `atomic.Int64` |
+| **Circuit breaker** | Защита от отказов | Три состояния |
+| **Closed** | Пропускает | Считает ошибки |
+| **Open** | Отклоняет | Ждёт timeout |
+| **Half-Open** | Пробные | 1–3 запроса |
+| **Threshold** | 5–10 | Ошибок до открытия |
+| **Timeout** | 10–60 сек | Время в Open |
+| **`ErrCircuitOpen`** | Ошибка | При открытом breaker |
+| **`context`** | Отмена | В `Call` |
+| **`gobreaker`** | Production | `NewCircuitBreaker` |
+| **`ReadyToTrip`** | Функция | Когда открывать |
+| **+ retry** | Полная защита | Не retry при open |
+| **+ rate limiter** | Порядок | Rate → breaker → retry |
+| **Метрики** | requests, failures, rejected | State changes |
 
-🔁 **Ключевая идея:** `select` фиксирован на этапе компиляции. Для динамических каналов — `reflect.Select`. `SelectCase` для каждого канала. Три типа: `SelectRecv`, `SelectSend`, `SelectDefault`. Динамический fan-in: N горутин для малых N, `reflect.Select` для больших. Приоритетный select через двойной `select`. Starvation возможен в приоритетном select. `reflect.Select` медленнее обычного `select` в 5-10 раз, но экономит память. Порог: ~100-1000 каналов. `ctx.Done()` как дополнительный case. **Удаляй закрытые каналы** из `cases`.
+⚡ **Ключевая идея:** Circuit breaker — паттерн для защиты от каскадных отказов. **Три состояния:** Closed (пропускает), Open (отклоняет), Half-Open (пробные). **Threshold 5–10**, **timeout 10–60 сек**, **halfOpenMax 1–3**. **`context`** для отмены. **`gobreaker`** — production-ready. Комбинируется с retry (не retry при open), rate limiter (rate → breaker → retry → HTTP), worker pool. Метрики: requests, successes, failures, rejected, stateChanges. Не используй свою реализацию в production — `gobreaker` лучше.

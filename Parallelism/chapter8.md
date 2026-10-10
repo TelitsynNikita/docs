@@ -1,2454 +1,430 @@
-# 🔀 Глава 8: Fan-in, Fan-out, Pipeline — конвейеры данных
+# 🌱 Глава 8: Generator — источник данных
 
 **Что вы узнаете:**
-- Что такое **fan-out** и две его реализации: N каналов и один общий.
-- Что такое **fan-in** и как слить N каналов в один.
-- Что такое **pipeline** и как построить многостадийную обработку.
-- Как работает **backpressure** между стадиями pipeline.
-- Что такое **tee-канал** и **bridge-канал**.
-- Как **отменять** pipeline через `context.Context`.
-- Как **закрывать** каналы в pipeline без утечек и deadlock.
-- Как диагностировать проблемы pipeline через pprof и метрики.
-- Как комбинировать pipeline с worker pool (Глава 7).
+- Что такое generator и какую задачу он решает.
+- Как построить простейший generator.
+- Как добавить отмену через `context`.
+- Как добавить обработку ошибок.
+- Как сделать generator с backpressure.
+- Как комбинировать generator с другими паттернами.
+- Как избежать утечек горутин в generator.
 
 **После прочтения вы сможете:**
-- Построить fan-out/fan-in для распределения и сбора работы.
-- Выбирать между двумя реализациями fan-out.
-- Построить pipeline из N стадий с backpressure.
-- Правильно закрывать каналы в каждой стадии.
-- Отменять pipeline через `context`.
-- Реализовать tee-канал (разветвление) и bridge-канал (склейка).
-- Диагностировать утечки и блокировки в pipeline.
-- Измерять пропускную способность и latency каждой стадии.
+- Построить generator с нуля.
+- Останавливать generator через `context`.
+- Передавать ошибки из generator.
+- Использовать generator в pipeline.
+- Понимать, где generator уместен, а где — нет.
 
 ---
 
 ## Содержание
 
-- [8.0 Пролог: конвейер, который встал](#80-пролог-конвейер-который-встал)
-- [8.1 Fan-out: распределение работы](#81-fan-out-распределение-работы)
-- [8.2 Fan-in: слияние результатов](#82-fan-in-слияние-результатов)
-- [8.3 Fan-out + Fan-in: полная схема](#83-fan-out--fan-in-полная-схема)
-- [8.4 Pipeline: многостадийная обработка](#84-pipeline-многостадийная-обработка)
-- [8.5 Backpressure в pipeline](#85-backpressure-в-pipeline)
-- [8.6 Закрытие каналов в pipeline](#86-закрытие-каналов-в-pipeline)
-- [8.7 Отмена pipeline через context](#87-отмена-pipeline-через-context)
-- [8.8 Tee-канал и bridge-канал](#88-tee-канал-и-bridge-канал)
-- [8.9 Pipeline vs worker pool: что выбрать](#89-pipeline-vs-worker-pool-что-выбрать)
-- [8.10 Практика Go: pipeline с метриками](#810-практика-go-pipeline-с-метриками)
-- [8.11 Выводы и типичные ошибки](#811-выводы-и-типичные-ошибки)
-- [8.12 Для быстрого повторения](#812-для-быстрого-повторения)
-- [8.13 Вопросы для самопроверки](#813-вопросы-для-самопроверки)
-- [8.14 Ответы](#814-ответы)
-- [8.15 Куда идти дальше?](#815-куда-идти-дальше)
-- [8.16 Чек-лист](#816-чек-лист)
+- [8.0 Пролог: откуда брать данные](#80-пролог-откуда-брать-данные)
+- [8.1 Что такое generator](#81-что-такое-generator)
+- [8.2 Простейший generator](#82-простейший-generator)
+- [8.3 Generator с контекстом](#83-generator-с-контекстом)
+- [8.4 Generator с ошибками](#84-generator-с-ошибками)
+- [8.5 Generator с backpressure](#85-generator-с-backpressure)
+- [8.6 В связке с другими паттернами](#86-в-связке-с-другими-паттернами)
+- [8.7 Практика Go: генераторы данных](#87-практика-go-генераторы-данных)
+- [8.8 Выводы и типичные ошибки](#88-выводы-и-типичные-ошибки)
+- [8.9 Для быстрого повторения](#89-для-быстрого-повторения)
+- [8.10 Вопросы для самопроверки](#810-вопросы-для-самопроверки)
+- [8.11 Ответы](#811-ответы)
+- [8.12 Куда идти дальше?](#812-куда-идти-дальше)
+- [8.13 Чек-лист](#813-чек-лист)
 
 ---
 
-## 8.0 Пролог: конвейер, который встал
+## 8.0 Пролог: откуда брать данные
 
-Ты пишешь ETL-пайплайн: читаешь логи из Kafka, парсишь, обогащаешь данными из БД, записываешь в ClickHouse.
-
-Наивная реализация:
+У нас есть сервис, который читает данные из источника и обрабатывает их. Источником может быть файл, база данных, внешний API, Kafka — что угодно. Работает так: читаем следующую запись, обрабатываем, читаем следующую.
 
 ```go
-func main() {
+func processAll() error {
     for {
-        msg := kafka.Read()
-        parsed := parse(msg)
-        enriched := enrich(parsed)
-        writeToClickHouse(enriched)
+        record, err := source.Read()
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return err
+        }
+        
+        if err := process(record); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+Работает. Но есть проблема: обработка одного сообщения может быть **долгой**. Пока обрабатываем — источник простаивает. И если обработка включает fan-out, worker pool или rate limiter — придётся **дополнительно** продумывать, как связать источник с обработчиками.
+
+Например, хочется запустить 10 воркеров параллельно:
+
+```go
+func processAll() error {
+    for {
+        record, err := source.Read()
+        if err == io.EOF {
+            break
+        }
+        go process(record)  // ← теперь надо думать про WaitGroup, ошибки, backpressure
     }
 }
 ```
 
-Всё работает. Пока не выясняется:
+Теперь нужно: ограничить параллелизм (10 воркеров, не 10 000), собрать ошибки из воркеров, понять, когда все завершатся. Код растёт, смешивается.
 
-- **Kafka быстрая** — 100 000 сообщений/сек.
-- **Парсинг быстрый** — 1 мкс на сообщение.
-- **Обогащение медленное** — 10 мс (запрос в БД).
-- **ClickHouse быстрый** — 100 мкс на запись.
+Хочется вынести **чтение** в отдельный компонент: он знает, **откуда** брать данные, и отдаёт их в канал. А дальше — как хочешь: воркеры, pipeline, что угодно. Этот компонент — **generator**.
 
-**Пропускная способность:** 1 / 10 мс = **100 сообщений/сек**. Хотя Kafka даёт 100 000.
-
-❓ **Что произошло?** Ты обрабатываешь сообщения **последовательно**. Обогащение — bottleneck. Пока одно сообщение обогащается, остальные ждут.
-
-💡 **Решение:** **pipeline** + **fan-out**.
-
-- **Стадия 1:** читаем из Kafka.
-- **Стадия 2:** парсим (быстро).
-- **Стадия 3:** обогащаем — **100 параллельных воркеров** (fan-out).
-- **Стадия 4:** пишем в ClickHouse.
-
-**Пропускная способность:** 100 воркеров × (1 / 10 мс) = **10 000 сообщений/сек**. В 100 раз быстрее.
-
-> **Важный мост к будущим главам:** pipeline — это обобщение worker pool (Глава 7). Fan-out — это worker pool для одной стадии. Fan-in — это слияние каналов. Backpressure — из Главы 7. Отмена через `context` — из Главы 5.
+> **Мост к следующим главам:** generator — самый простой паттерн. Он лежит в основе fan-in (Глава 9), fan-out (Глава 10), pipeline (Глава 11). Понимание generator даёт понимание, как строить конвейеры данных.
 
 ---
 
-## 8.1 Fan-out: распределение работы
+## 8.1 Что такое generator
 
-**Fan-out** — это распределение работы от **одного** источника к **нескольким** обработчикам.
+**Generator** — это функция, которая отдаёт данные в канал. Она сама решает, **откуда** брать данные и **когда** остановиться.
+
+### Сигнатура
+
+```go
+func generator(...) <-chan T
+```
+
+**Ключевые свойства:**
+
+- Возвращает **receive-only** канал — потребитель не может в него писать.
+- Запускает **свою горутину** для чтения данных.
+- **Закрывает канал**, когда данные закончились.
+- Создаёт **одну точку**, где определяется «откуда данные».
 
 ### Схема
 
 ```
-                  ┌──────────┐
-              ┌──▶│ Worker 1 │──┐
-              │   └──────────┘  │
-              │   ┌──────────┐  │
-   ┌──────┐   ├──▶│ Worker 2 │──┤   ┌─────────┐
-   │Source│───┤   └──────────┘  ├──▶│ Results │
-   └──────┘   │   ┌──────────┐  │   └─────────┘
-              ├──▶│ Worker 3 │──┤
-              │   └──────────┘  │
-              │   ┌──────────┐  │
-              └──▶│ Worker N │──┘
-                  └──────────┘
+┌─────────────────────────────┐
+│      Generator               │
+│                              │
+│  func generator():           │
+│    1. Создать канал          │
+│    2. Запустить горутину     │
+│    3. Читать из источника    │
+│    4. Писать в канал         │
+│    5. close(out) при EOF     │
+│    6. Вернуть out            │
+│                              │
+└──────────────┬──────────────┘
+               │
+               │ ←chan T
+               ▼
+        Потребитель
+        for v := range ch {
+           process(v)
+        }
 ```
 
-**Source** пишет в **один канал**. N воркеров читают из него. Каждый воркер обрабатывает **свою** порцию задач.
+### Когда использовать generator
 
-**Ключевое:** fan-out — это **распределение**, не **дублирование**. Каждое значение идёт **одному** воркеру.
+**1. Источник данных с логикой.**
 
-### Шаг 1: generator — источник данных
+- Чтение из файла построчно.
+- Пагинация API.
+- Обход дерева.
+- Генерация последовательностей.
 
-Начнём с простого: функция, которая отдаёт данные в канал.
+**2. Унификация источника.**
 
-```go
-func generator(data []int) chan int {
-	out := make(chan int)
+- Один интерфейс — много источников.
+- Легко подменить Kafka на файл.
 
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
+**3. Развязка чтения и обработки.**
 
-	return out
-}
-```
+- Generator знает только «как читать».
+- Потребитель знает только «как обрабатывать».
 
-**Что делает:**
+### Когда НЕ использовать generator
 
-1. Создаёт канал.
-2. Запускает горутину, которая пишет данные.
-3. Когда данные закончились — `close(out)`.
-4. Возвращает канал.
+**1. Одиночное чтение.**
 
-**Использование:**
+Если нужно прочитать один объект — функция возвращает его напрямую, без канала.
 
-```go
-ch := generator([]int{1, 2, 3, 4, 5})
-for v := range ch {
-    fmt.Println(v)
-}
-```
+**2. Маленький объём.**
 
-### Шаг 2: worker — обработчик одной задачи
+Для 100 записей overhead канала может быть избыточным. Но обычно не критично.
 
-Прежде чем делать fan-out, определим, **что делает один воркер**.
+**3. Данные уже в памяти.**
 
-```go
-func worker(input <-chan int) chan int {
-	out := make(chan int)
+Если у тебя `[]Item` — просто верни слайс. Не нужно оборачивать в канал.
 
-	go func() {
-		defer close(out)
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-
-	return out
-}
-
-func process(v int) int {
-	return v * 2  // для примера
-}
-```
-
-**Что делает:**
-
-1. Создаёт **свой** выходной канал.
-2. Читает из **общего** входного канала.
-3. Обрабатывает каждое значение.
-4. Пишет в **свой** выход.
-5. При закрытии входа — `close(out)`.
-
-**Ключевое:** каждый воркер **не знает** о других воркерах. Он просто читает из входа.
-
-### Шаг 3: fan-out — N воркеров
-
-Теперь запустим **N воркеров**, каждый читает из **одного** входа.
-
-```go
-func fanOut(input <-chan int, n int) []chan int {
-	outputs := make([]chan int, n)
-	for i := 0; i < n; i++ {
-		outputs[i] = worker(input)
-	}
-	return outputs
-}
-```
-
-**Что делает:**
-
-1. Создаёт слайс из N каналов.
-2. Для каждого — запускает воркер.
-3. Возвращает слайс каналов.
-
-**Что происходит:**
-
-- N горутин читают из **одного** `input`.
-- Распределение **автоматическое** — какое значение попадёт какому воркеру, решает runtime.
-- Каждый воркер пишет в **свой** `outputs[i]`.
-
-**Визуализация:**
-
-```
-input: [1, 2, 3, 4, 5, 6, 7, 8]
-
-Воркер 0: [1, 5, 7]      → outputs[0]
-Воркер 1: [2, 4, 8]      → outputs[1]
-Воркер 2: [3, 6]         → outputs[2]
-
-Распределение случайное. Каждое значение попадает ТОЛЬКО в один output.
-```
-
-### Шаг 4: полный main
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-func main() {
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input := generator(data)
-
-	const numWorkers = 3
-	outputs := fanOut(input, numWorkers)
-
-	var wg sync.WaitGroup
-	for i, out := range outputs {
-		wg.Add(1)
-		go func(id int, ch chan int) {
-			defer wg.Done()
-			for v := range ch {
-				fmt.Printf("Worker %d: %d\n", id, v)
-			}
-		}(i, out)
-	}
-	wg.Wait()
-	fmt.Println("done")
-}
-
-func generator(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-
-func fanOut(input <-chan int, n int) []chan int {
-	outputs := make([]chan int, n)
-	for i := 0; i < n; i++ {
-		outputs[i] = worker(input)
-	}
-	return outputs
-}
-
-func worker(input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-
-	return out
-}
-
-func process(v int) int {
-	return v * 2
-}
-```
-
-**Пример вывода:**
-
-```
-Worker 1: 4
-Worker 0: 2
-Worker 2: 6
-Worker 0: 8
-Worker 1: 10
-...
-```
-
-**Что видно:** значения распределились между воркерами. Каждое значение обработано **один раз**.
-
-### Шаг 5: альтернативная реализация — один общий канал результатов
-
-В **реализации A** (шаги 1–4) каждый воркер пишет в **свой** канал. Но чаще воркеры пишут в **один общий** канал.
-
-**Реализация B:**
-
-```go
-func fanOutShared(input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				out <- process(v)
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-**Что изменилось:**
-
-- **Один** канал результатов вместо N.
-- N воркеров пишут в него.
-- `wg.Wait()` + `close(out)` — как в fan-in.
-
-**Разберём по частям.**
-
-#### Шаг 5.1: запуск N воркеров
-
-```go
-for i := 0; i < n; i++ {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-}
-```
-
-**Что делает:**
-
-- Запускает N горутин.
-- Каждая читает из **общего** `input`.
-- Каждая пишет в **общий** `out`.
-
-**Ключевое:** `input` и `out` — **одни и те же** каналы для всех воркеров.
-
-#### Шаг 5.2: закрытие out
-
-```go
-go func() {
-	wg.Wait()
-	close(out)
-}()
-```
-
-**Что делает:**
-
-- Отдельная горутина ждёт `wg.Wait()`.
-- Когда **все** воркеры завершились — `close(out)`.
-
-**Почему отдельная горутина:** если `wg.Wait()` и `close(out)` в main — main заблокируется на `Wait`, `out` не закроется, читатели зависнут.
-
-### Шаг 6: полный main для реализации B
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-func main() {
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input := generator(data)
-
-	const numWorkers = 3
-	output := fanOutShared(input, numWorkers)
-
-	for v := range output {
-		fmt.Println(v)
-	}
-	fmt.Println("done")
-}
-
-func generator(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-
-func fanOutShared(input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				out <- process(v)
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-func process(v int) int {
-	return v * 2
-}
-```
-
-**Пример вывода:**
-
-```
-4
-2
-6
-8
-10
-12
-14
-16
-18
-20
-```
-
-**Что видно:** все значения в **одном** канале. Порядок **не гарантирован** — воркеры пишут параллельно.
-
-### Сравнение реализаций
-
-| Аспект | A: N каналов | B: один канал |
-|:---|:---|:---|
-| Каналов результатов | N | 1 |
-| Горутин | N (воркеры) + N (читатели) | N (воркеры) + 1 (close) |
-| Сложность | Средняя | Простая |
-| Потребитель | Читает N каналов | Читает 1 канал |
-| Гибкость | Высокая (разные обработчики) | Низкая |
-| Contention | Высокий (N+1 каналов) | Низкий (1 канал) |
-
-**Рекомендация:**
-
-- **Реализация B (один канал)** — для большинства случаев.
-- **Реализация A (N каналов)** — если нужно обрабатывать результаты **разных** воркеров по-разному.
-
-### Шаг 7: обработка N каналов через `received` + `ch = nil`
-
-В **реализации A** потребитель читает из N каналов. Наивный подход — `select` в цикле. Но есть **баг**, который часто допускают.
-
-**❌ Неправильно: `i--` при `!ok`**
-
-```go
-for i := 0; i < len(data); i++ {
-	select {
-	case v, ok := <-ch1:
-		if !ok {
-			i--       // ← БАГ
-			continue
-		}
-		fmt.Println("Channel 1:", v)
-	case v, ok := <-ch2:
-		if !ok {
-			i--
-			continue
-		}
-		fmt.Println("Channel 2:", v)
-	case v, ok := <-ch3:
-		if !ok {
-			i--
-			continue
-		}
-		fmt.Println("Channel 3:", v)
-	}
-}
-```
-
-**Проблема:** `i--` при `!ok` — это **busy loop**. Если `ch1` закрыт, `<-ch1` возвращает `0, false` **немедленно**. Цикл крутится, `i--` компенсирует, но если все каналы закрыты, а `i < len(data)` — **бесконечный цикл**.
-
-**✅ Правильно: `received` + `ch = nil`**
-
-```go
-total := len(data)
-received := 0
-
-for received < total {
-	select {
-	case v, ok := <-ch1:
-		if ok {
-			fmt.Println("Channel 1:", v)
-			received++
-		} else {
-			ch1 = nil  // ← отключаем case
-		}
-	case v, ok := <-ch2:
-		if ok {
-			fmt.Println("Channel 2:", v)
-			received++
-		} else {
-			ch2 = nil
-		}
-	case v, ok := <-ch3:
-		if ok {
-			fmt.Println("Channel 3:", v)
-			received++
-		} else {
-			ch3 = nil
-		}
-	}
-}
-```
-
-**Почему `ch1 = nil` работает:**
-
-- Приём из nil-канала **блокируется навсегда** (Глава 2, подглава 2.8).
-- `select` **игнорирует** case с nil-каналом.
-- Так закрытые каналы «выключаются» из `select`.
-
-**Полный main для реализации A:**
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-func main() {
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	ch := generator(data)
-
-	ch1 := fanOut(ch)
-	ch2 := fanOut(ch)
-	ch3 := fanOut(ch)
-
-	total := len(data)
-	received := 0
-
-	for received < total {
-		select {
-		case v, ok := <-ch1:
-			if ok {
-				fmt.Println("Channel 1:", v)
-				received++
-			} else {
-				ch1 = nil
-			}
-		case v, ok := <-ch2:
-			if ok {
-				fmt.Println("Channel 2:", v)
-				received++
-			} else {
-				ch2 = nil
-			}
-		case v, ok := <-ch3:
-			if ok {
-				fmt.Println("Channel 3:", v)
-				received++
-			} else {
-				ch3 = nil
-			}
-		}
-	}
-}
-
-func generator(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-
-func fanOut(ch <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range ch {
-			out <- v
-		}
-	}()
-
-	return out
-}
-```
-
-**Важное замечание:** в твоём варианте `fanOut(ch)` создаёт **отдельную** горутину для **каждого** вызова. Три вызова → три горутины, конкурирующие за чтение из `ch`. Это **распределение**, не дублирование. Каждое значение попадёт **только в один** из `ch1`, `ch2`, `ch3`.
-
-### Шаг 8: fan-out с отменой через context
-
-Добавим `context` для отмены.
-
-```go
-func fanOutCtx(ctx context.Context, input <-chan int, n int) []chan int {
-	outputs := make([]chan int, n)
-	for i := 0; i < n; i++ {
-		outputs[i] = workerCtx(ctx, input)
-	}
-	return outputs
-}
-
-func workerCtx(ctx context.Context, input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			select {
-			case out <- process(v):
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-```
-
-**Что изменилось:** воркер проверяет `ctx.Done()` при отправке. Если контекст отменён — завершается.
-
-**Аналогично для реализации B:**
-
-```go
-func fanOutSharedCtx(ctx context.Context, input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				select {
-				case out <- process(v):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-### Сколько воркеров
-
-**Те же правила, что в Главе 7:**
-
-- CPU-bound → `GOMAXPROCS`.
-- I/O-bound → 10-100.
-
-### Аннотация сложности
-
-| Аспект | Реализация A (N каналов) | Реализация B (один канал) |
-|:---|:---|:---|
-| Каналов результатов | N | 1 |
-| Горутин | 2N + 1 | N + 2 |
-| Память | 2N × 2.3 КБ | (N + 2) × 2.3 КБ |
-| Contention | Высокий | Низкий |
-| Гибкость | Высокая | Низкая |
-
-### 💡 Практика: как использовать fan-out
+### 💡 Практика: как думать о generator
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Реализация B (один канал)** — для большинства случаев.
-2. **Реализация A (N каналов)** — если нужна гибкость.
-3. **N по типу задачи:** CPU-bound → `GOMAXPROCS`, I/O-bound → 10-100.
-4. **Отключай закрытые каналы через `ch = nil`**, не через `i--`.
+1. **Возвращай `<-chan T`**, не `chan T`.
+2. **Закрывай канал, когда данные закончились.**
+3. **Запускай горутину внутри generator.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-5. **Отмена через `context`** — в `select` при отправке.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-6. **Динамическое N** — для переменной нагрузки (см. 7.7).
+4. **Принимай `context`**, если чтение может быть долгим.
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не используй `i--` при `!ok`.** Busy loop.
-8. **Не путай fan-out с tee.** Fan-out распределяет, tee дублирует.
-9. **Не создавай канал на каждого воркера**, если можно обойтись одним.
-
-### Ключевые выводы подглавы 8.1
-
-- **Fan-out** — распределение работы от одного источника к N обработчикам.
-- **Реализация A:** N каналов результатов, N воркеров + N читателей. Гибко, но больше горутин.
-- **Реализация B:** один канал результатов, N воркеров + 1 для close. Проще и быстрее.
-- **Каждое значение идёт одному воркеру** (не дублируется).
-- **Отключение закрытых каналов через `ch = nil`**, не через `i--`.
-- **N** — по типу задачи.
+5. **Не создавай generator без закрытия канала.** Утечка.
+6. **Не используй generator, если данные уже в памяти.**
 
 ---
 
-## 8.2 Fan-in: слияние результатов
+## 8.2 Простейший generator
 
-**Fan-in** — это слияние **нескольких** каналов в **один**.
+Начнём с самого простого.
 
-### Схема
-
-```
-   ┌─────────┐
-   │Channel 1│──┐
-   └─────────┘  │
-   ┌─────────┐  │
-   │Channel 2│──┤   ┌──────────┐
-   └─────────┘  ├──▶│ Combined │
-   ┌─────────┐  │   └──────────┘
-   │Channel 3│──┤
-   └─────────┘  │
-   ┌─────────┐  │
-   │Channel N│──┘
-   └─────────┘
-```
-
-**N каналов** объединяются в **один**. Все результаты идут в один поток.
-
-### Шаг 1: makeChan — источники данных
-
-Начнём с простого генератора:
+### Пример: генератор чисел
 
 ```go
-func makeChan(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
+func numbers(n int) <-chan int {
+    out := make(chan int)
+    
+    go func() {
+        defer close(out)
+        for i := 0; i < n; i++ {
+            out <- i
+        }
+    }()
+    
+    return out
 }
 ```
-
-**Использование:**
-
-```go
-ch1 := makeChan([]int{1, 2, 3, 4, 5})
-ch2 := makeChan([]int{6, 7, 8, 9, 10})
-```
-
-**Что происходит:** два независимых канала, каждый отдаёт свои данные.
-
-### Шаг 2: наивный merge — один канал
-
-**❌ Наивная попытка:** читать из двух каналов в одной горутине.
-
-```go
-func naiveMerge(ch1, ch2 <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range ch1 {
-			out <- v
-		}
-		for v := range ch2 {
-			out <- v
-		}
-	}()
-
-	return out
-}
-```
-
-**Проблема:** если `ch1` долго не закрывается, `ch2` не читается. **Нет параллелизма.**
 
 **Что происходит:**
 
-```
-t=0:    Читаем из ch1
-        ch1 отдаёт 1, 2, 3, ...
-        ch2 ждёт (никто не читает)
+1. Создаём канал.
+2. Запускаем горутину.
+3. В горутине: пишем числа 0..n-1 в канал.
+4. Когда закончили — `defer close(out)`.
+5. Возвращаем канал.
 
-t=T:    ch1 закрылся
-        Начинаем читать ch2
-        ch2 отдаёт 6, 7, 8, ...
-```
-
-**Результат:** значения из `ch2` идут **после** всех значений из `ch1`.
-
-### Шаг 3: fan-in через N горутин
-
-**Правильная реализация:** для **каждого** входного канала — **своя** горутина.
+### Потребитель
 
 ```go
-func fanIn(channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				out <- v
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+func main() {
+    for v := range numbers(10) {
+        fmt.Println(v)
+    }
 }
 ```
 
-**Разберём по частям.**
+**Что происходит:**
 
-#### Шаг 3.1: один канал — одна горутина
+- `range` читает, пока канал открыт.
+- Когда generator закрыл канал — цикл завершается.
 
-```go
-for _, ch := range channels {
-	wg.Add(1)
-	go func(c <-chan int) {
-		defer wg.Done()
-		for v := range c {
-			out <- v
-		}
-	}(ch)
-}
-```
-
-**Что делает:**
-
-- Для **каждого** входного канала запускается горутина.
-- Горутина читает из **своего** канала.
-- Пишет в **общий** `out`.
-
-**Ключевое:** `ch` передаётся как **аргумент** (`c <-chan int`), а не захватывается замыканием. Иначе все горутины читали бы из **последнего** `ch`.
-
-**Почему это работает:**
-
-- `ch1` читается горутиной 1.
-- `ch2` читается горутиной 2.
-- Обе пишут в `out`.
-- `out` получает значения из **обоих** каналов.
-
-#### Шаг 3.2: закрытие out
-
-```go
-go func() {
-	wg.Wait()
-	close(out)
-}()
-```
-
-**Что делает:**
-
-- Отдельная горутина ждёт `wg.Wait()`.
-- Когда **все** горутины-читатели завершились — `close(out)`.
-
-**Почему отдельная горутина:**
-
-- Если `wg.Wait()` и `close(out)` в main — main заблокируется на `Wait`.
-- `out` не будет закрыт, пока main ждёт.
-- Читатели `out` (если они в main) зависнут.
-
-**Почему `close(out)` после `wg.Wait()`:**
-
-- Пока хотя бы одна горутина пишет в `out`, `close` нельзя.
-- `wg.Wait()` гарантирует, что **все** горутины завершились.
-- Только после этого `close(out)` безопасен.
-
-### Шаг 4: полный main
+### Полный код
 
 ```go
 package main
 
-import (
-	"fmt"
-	"sync"
-)
+import "fmt"
+
+func numbers(n int) <-chan int {
+    out := make(chan int)
+    
+    go func() {
+        defer close(out)
+        for i := 0; i < n; i++ {
+            out <- i
+        }
+    }()
+    
+    return out
+}
 
 func main() {
-	ch1 := makeChan([]int{1, 2, 3, 4, 5})
-	ch2 := makeChan([]int{6, 7, 8, 9, 10})
-
-	out := fanIn(ch1, ch2)
-
-	for v := range out {
-		fmt.Println(v)
-	}
-}
-
-func makeChan(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-
-func fanIn(channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				out <- v
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+    for v := range numbers(10) {
+        fmt.Println(v)
+    }
+    fmt.Println("done")
 }
 ```
 
 **Пример вывода:**
 
 ```
+0
 1
-6
 2
-7
 3
-8
 4
-9
 5
-10
+6
+7
+8
+9
+done
 ```
 
-**Что видно:**
-
-- Значения из `ch1` и `ch2` **перемешаны**.
-- Порядок **не гарантирован** — зависит от скорости каналов.
-- Все 10 значений прочитаны.
-
-### Шаг 5: fan-in с отменой через context
-
-Добавим `context` для отмены:
+### Generator из слайса
 
 ```go
-func fanInCtx(ctx context.Context, channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				select {
-				case out <- v:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+func fromSlice(items []string) <-chan string {
+    out := make(chan string)
+    
+    go func() {
+        defer close(out)
+        for _, item := range items {
+            out <- item
+        }
+    }()
+    
+    return out
 }
 ```
 
-**Что изменилось:** читатели проверяют `ctx.Done()` при отправке. Если контекст отменён — завершаются.
+**Что делает:** оборачивает слайс в канал. Полезно, когда нужно единообразно работать с источниками — не важно, откуда данные, все они приходят через канал.
 
-### Шаг 6: полный main с context
+### Generator строк из файла
 
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-)
-
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	ch1 := makeChan(ctx, []int{1, 2, 3, 4, 5})
-	ch2 := makeChan(ctx, []int{6, 7, 8, 9, 10})
-
-	out := fanIn(ctx, ch1, ch2)
-
-	for v := range out {
-		fmt.Println(v)
-	}
-}
-
-func makeChan(ctx context.Context, data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			select {
-			case out <- v:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func fanIn(ctx context.Context, channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				select {
-				case out <- v:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+func linesFromFile(path string) (<-chan string, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return nil, err
+    }
+    
+    out := make(chan string)
+    
+    go func() {
+        defer close(out)
+        defer f.Close()
+        
+        scanner := bufio.NewScanner(f)
+        for scanner.Scan() {
+            out <- scanner.Text()
+        }
+    }()
+    
+    return out, nil
 }
 ```
 
-### Порядок результатов
+**Что делает:** построчно читает файл и пишет в канал.
 
-**Порядок не гарантирован.** Значения из разных каналов приходят в порядке готовности. Если важен порядок — нужно дополнительное упорядочивание (например, по ID).
+### Аналогия: конвейер
 
-### Альтернатива: `reflect.Select`
+Generator — как **входная часть конвейера**. Он подхватывает сырьё (данные из источника) и кладёт на ленту (канал). Дальше лента несёт сырьё к обработчикам.
 
-**`reflect.Select`** позволяет динамически выбирать из N каналов:
-
-```go
-func fanInReflect(channels []<-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		cases := make([]reflect.SelectCase, len(channels))
-		for i, ch := range channels {
-			cases[i] = reflect.SelectCase{
-				Dir:  reflect.SelectRecv,
-				Chan: reflect.ValueOf(ch),
-			}
-		}
-		for len(cases) > 0 {
-			i, v, ok := reflect.Select(cases)
-			if !ok {
-				cases = append(cases[:i], cases[i+1:]...)
-				continue
-			}
-			out <- v.Interface().(int)
-		}
-	}()
-
-	return out
-}
-```
-
-**Плюсы:**
-
-- **Одна горутина**, а не N.
-- **Меньше памяти.**
-
-**Минусы:**
-
-- **`reflect` медленнее** (~10x).
-- **Сложнее код.**
-
-**Рекомендация:** для N < 100 — простая реализация с N горутинами. Для N > 1000 — `reflect.Select`.
-
-### Сравнение реализаций
-
-| Реализация | Горутин | Time (per element) | Сложность |
-|:---|:---|:---|:---|
-| N горутин | N + 1 | ~50-100 нс | Простая |
-| `reflect.Select` | 1 | ~500-1000 нс | Сложная |
-
-### Аннотация сложности
-
-| Аспект | Значение |
-|:---|:---|
-| Горутин | N + 1 |
-| Память | (N + 1) × 2.3 КБ |
-| Пропускная способность | sum(rate_channels) |
-
-### 💡 Практика: как использовать fan-in
+### 💡 Практика: как писать простой generator
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Для каждого канала — своя горутина.**
-2. **`ch` передавай как аргумент**, не замыкание.
-3. **`wg.Wait()` + `close(out)` в отдельной горутине.**
-4. **`select` с `ctx.Done()`** для отмены.
+1. **`defer close(out)`** сразу после `make(chan)`.
+2. **Возвращай `<-chan T`** — receive-only.
+3. **Пиши в канал в отдельной горутине.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-5. **`reflect.Select`** — если N > 1000.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-6. **Буферизованный `out`** — для снижения contention.
+4. **Для файлов — `defer f.Close()` в той же горутине.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не забывай `close(out)`.** Иначе collector зависнет.
-8. **Не используй `Mutex` для слияния** — канал проще и безопаснее.
-
-### Ключевые выводы подглавы 8.2
-
-- **Fan-in** — слияние N каналов в один.
-- **N горутин + 1** для `close`.
-- **`ch` передавай как аргумент**, не замыкание.
-- **Порядок не гарантирован.**
-- **`reflect.Select`** — для больших N.
-- **`context`** — для отмены.
+5. **Не пиши в канал из вызывающей горутины** — получится deadlock.
+6. **Не забывай `close`.**
 
 ---
 
-## 8.3 Fan-out + Fan-in: полная схема
+## 8.3 Generator с контекстом
 
-Соберём **полную схему** fan-out + fan-in.
+Простейший generator не умеет останавливаться. Если потребитель перестал читать — горутина generator зависнет.
 
-### Шаг 1: generator
-
-```go
-func generator(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-```
-
-### Шаг 2: fan-out
+### Проблема
 
 ```go
-func fanOut(input <-chan int, n int) []chan int {
-	outputs := make([]chan int, n)
-	for i := 0; i < n; i++ {
-		outputs[i] = worker(input)
-	}
-	return outputs
-}
-
-func worker(input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-
-	return out
-}
-
-func process(v int) int {
-	return v * 2
-}
-```
-
-### Шаг 3: fan-in
-
-```go
-func fanIn(channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				out <- v
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-### Шаг 4: полный main
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
 func main() {
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input := generator(data)
-
-	const numWorkers = 3
-	outputs := fanOut(input, numWorkers)
-	merged := fanIn(outputs...)
-
-	for v := range merged {
-		fmt.Println(v)
-	}
-	fmt.Println("done")
-}
-
-func generator(data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			out <- v
-		}
-	}()
-
-	return out
-}
-
-func fanOut(input <-chan int, n int) []chan int {
-	outputs := make([]chan int, n)
-	for i := 0; i < n; i++ {
-		outputs[i] = worker(input)
-	}
-	return outputs
-}
-
-func worker(input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-
-	return out
-}
-
-func process(v int) int {
-	return v * 2
-}
-
-func fanIn(channels ...<-chan int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				out <- v
-			}
-		}(ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+    for v := range numbers(1_000_000) {
+        if v > 10 {
+            break  // ← вышли из цикла
+        }
+        fmt.Println(v)
+    }
 }
 ```
 
 **Что происходит:**
 
-```
-t=0:    generator пишет в input
-        3 воркера читают из input
-        Каждый пишет в свой output
-        fanIn: 3 горутины читают из outputs
-        fanIn: пишет в merged
-        main: читает из merged
+- `main` вышел из цикла после `v == 10`.
+- Generator продолжает писать в канал.
+- Канал небуферизованный — generator блокируется на `out <- v`.
+- **Утечка горутины.**
 
-t=T:    generator закрыл input
-        Воркеры дочитали остатки, закрыли свои outputs
-        fanIn-горутины видят close, завершаются
-        wg.Wait() вернулся, close(merged)
-        main видит close, завершается
-```
+### Решение: context
 
-### Сколько горутин
-
-| Компонент | Горутин |
-|:---|:---|
-| generator | 1 |
-| Воркеры (fan-out) | N |
-| fan-in читатели | N |
-| fan-in close | 1 |
-| main | 1 |
-| **Итого** | **2N + 3** |
-
-**Для N = 3:** 9 горутин.
-
-### Альтернатива: fan-out с общим каналом
-
-**Fan-out + fan-in** можно упростить, если воркеры пишут в **один** канал результатов:
+Добавляем `context` для отмены:
 
 ```go
-func fanOutShared(input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				out <- process(v)
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-**Полный main:**
-
-```go
-func main() {
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	input := generator(data)
-	out := fanOutShared(input, 3)
-
-	for v := range out {
-		fmt.Println(v)
-	}
-}
-```
-
-**Что изменилось:** вместо N каналов + fan-in — **один** канал. Горутин: N + 2 вместо 2N + 3.
-
-### Сравнение
-
-| Подход | Горутин (N=3) | Сложность | Гибкость |
-|:---|:---|:---|:---|
-| Fan-out A + fan-in | 9 | Средняя | Высокая |
-| Fan-out B (общий) | 5 | Низкая | Низкая |
-
-### 💡 Практика: какую схему выбрать
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Fan-out B (общий канал)** — для большинства случаев.
-2. **Fan-out A + fan-in** — если нужна гибкость.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-3. **Буферизованные каналы** для снижения contention.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-4. **`reflect.Select`** — для больших N.
-
-**❌ НЕ ДЕЛАЙ:**
-
-5. **Не создавай N + 1 каналов**, если можно обойтись одним.
-
-### Ключевые выводы подглавы 8.3
-
-- **Fan-out + fan-in** — классическая комбинация.
-- **Горутин:** 2N + 3 для fan-out A + fan-in, N + 2 для fan-out B.
-- **Fan-out B** — проще и быстрее.
-- **Fan-out A + fan-in** — для гибкости.
-
----
-
-## 8.4 Pipeline: многостадийная обработка
-
-**Pipeline** — это **цепочка стадий**, где каждая стадия:
-
-1. Читает из входного канала.
-2. Обрабатывает.
-3. Пишет в выходной канал.
-
-### Схема
-
-```
-┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-│  Source  │──▶│  Stage 1 │──▶│  Stage 2 │──▶│  Stage 3 │──▶ Sink
-└──────────┘   └──────────┘   └──────────┘   └──────────┘
-   (Kafka)      (parse)        (enrich)      (write)
-```
-
-**Каждая стадия — это функция**, которая принимает входной канал и возвращает выходной.
-
-### Шаг 1: простая стадия
-
-**Стадия** — функция с сигнатурой:
-
-```go
-func stage(ctx context.Context, input <-chan int) chan int
-```
-
-**Пример: parseStage**
-
-```go
-func parseStage(ctx context.Context, input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			parsed := parse(v)
-			select {
-			case out <- parsed:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func parse(v int) int {
-	return v * 2
-}
-```
-
-**Что делает:**
-
-1. Создаёт выходной канал.
-2. Запускает горутину.
-3. Читает из входа, парсит, пишет в выход.
-4. При `ctx.Done()` — завершается.
-5. При закрытии входа — `close(out)`.
-
-### Шаг 2: стадия с fan-out
-
-**Стадия, которая делает fan-out:**
-
-```go
-func enrichStage(ctx context.Context, input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				enriched := enrich(ctx, v)
-				select {
-				case out <- enriched:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-func enrich(ctx context.Context, v int) int {
-	// имитация запроса в БД
-	time.Sleep(1 * time.Millisecond)
-	return v + 100
-}
-```
-
-**Что делает:**
-
-1. N воркеров читают из **общего** входа.
-2. Каждый обогащает значение.
-3. Пишут в **общий** выход.
-4. `wg.Wait()` + `close(out)`.
-
-### Шаг 3: сборка pipeline
-
-```go
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	source := generator([]int{1, 2, 3, 4, 5})
-	parsed := parseStage(ctx, source)
-	enriched := enrichStage(ctx, parsed, 10)
-
-	for v := range enriched {
-		fmt.Println(v)
-	}
+func numbersCtx(ctx context.Context, n int) <-chan int {
+    out := make(chan int)
+    
+    go func() {
+        defer close(out)
+        for i := 0; i < n; i++ {
+            select {
+            case out <- i:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    
+    return out
 }
 ```
 
 **Что происходит:**
 
-- generator → parseStage → enrichStage → main.
-- Каждая стадия — отдельная горутина (или N горутин).
-- Backpressure автоматически.
-
-### Шаг 4: полный код
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-)
-
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	data := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-
-	source := generator(ctx, data)
-	parsed := parseStage(ctx, source)
-	enriched := enrichStage(ctx, parsed, 5)
-
-	for v := range enriched {
-		fmt.Println(v)
-	}
-	fmt.Println("done")
-}
-
-func generator(ctx context.Context, data []int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			select {
-			case out <- v:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func parseStage(ctx context.Context, input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			parsed := parse(v)
-			select {
-			case out <- parsed:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func parse(v int) int {
-	return v * 2
-}
-
-func enrichStage(ctx context.Context, input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				enriched := enrich(ctx, v)
-				select {
-				case out <- enriched:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-func enrich(ctx context.Context, v int) int {
-	time.Sleep(1 * time.Millisecond)
-	return v + 100
-}
-```
-
-### Визуализация pipeline
-
-```
-generator → source
-              │
-              ▼
-         parseStage → parsed
-              │
-              ▼
-         enrichStage (5 воркеров) → enriched
-              │
-              ▼
-            main (collector)
-```
-
-### Backpressure между стадиями
-
-**Каждая стадия — отдельная горутина.** Если стадия медленная — её входной канал заполняется. Предыдущая стадия **блокируется** на `out <- msg`. Это **backpressure**.
-
-```
-Source (быстро) → parsed (заполнен) → enrich (медленно)
-                                     ↑
-                              backpressure
-```
-
-### Сравнение с последовательной обработкой
-
-**Последовательно:**
-
-```
-10 сообщений × (1 мкс parse + 1 мс enrich) = 10.1 мс
-```
-
-**Pipeline:**
-
-```
-10 сообщений / 5 воркеров × 1 мс = 2 мс
-```
-
-**В 5 раз быстрее.**
-
-### Аннотация сложности
-
-| Аспект | Последовательно | Pipeline |
-|:---|:---|:---|
-| Пропускная способность | 1 / sum(times) | N / max(time) |
-| Latency (per message) | sum(times) | sum(times) |
-| Горутин | 1 | N + 2 |
-
-### 💡 Практика: как строить pipeline
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Каждая стадия — функция** `func(ctx, input) chan T`.
-2. **`defer close(out)`** в каждой стадии.
-3. **`select` с `ctx.Done()`** для отмены.
-4. **Fan-out для медленных стадий.**
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-5. **Буферизованные каналы** между стадиями.
-
-**🤔 НЕ ОБЯЗАТЕЛЬНО:**
-
-6. **Динамическое N** — для переменной нагрузки.
-
-**❌ НЕ ДЕЛАЙ:**
-
-7. **Не делай стадии слишком мелкими.** Overhead на каналы.
-8. **Не забывай `close`.** Утечка горутин.
-
-### Ключевые выводы подглавы 8.4
-
-- **Pipeline** — цепочка стадий, каждая читает из входа и пишет в выход.
-- **Стадия — функция** `func(ctx, input) chan T`.
-- **Fan-out** для медленных стадий.
-- **Backpressure** между стадиями автоматически.
-- **В N раз быстрее** последовательной обработки.
-
----
-
-## 8.5 Backpressure в pipeline
-
-Разберём **backpressure** между стадиями.
-
-### Как работает backpressure
-
-**Backpressure** — это когда **медленная стадия замедляет быструю**.
-
-```
-Source (быстро) → parsed (буфер 100) → enrich (медленно)
-```
-
-**Что происходит:**
-
-1. Source пишет в `parsed` быстро.
-2. `parsed` заполняется (100 элементов).
-3. Source **блокируется** на `parsed <- msg`.
-4. Source ждёт, пока enrich не заберёт из `parsed`.
-5. Enrich обрабатывает медленно → `parsed` остаётся полным.
-6. Source продолжает ждать.
-
-**Результат:** Source работает со скоростью enrich.
-
-### Размер буфера и backpressure
-
-**Маленький буфер (1-10):**
-
-- Backpressure **быстрый**.
-- Source блокируется часто.
-- Меньше памяти.
-
-**Большой буфер (1000+):**
-
-- Backpressure **отложенный**.
-- Source блокируется редко.
-- Больше памяти.
-
-**Очень большой буфер (100 000):**
-
-- Backpressure **не работает**.
-- Source пишет всё в буфер.
-- Память растёт.
-
-### Визуализация
-
-```
-Маленький буфер (10):
-
-  Source: ████████░░░░░░░░░░░░░░░░ (блокируется)
-  Enrich: ████░░░░░░░░░░░░░░░░░░░░ (медленно)
-  
-  Source работает со скоростью Enrich.
-
-Большой буфер (1000):
-
-  Source: ████████████████████████ (не блокируется)
-  Enrich: ████░░░░░░░░░░░░░░░░░░░░ (медленно)
-  
-  Буфер заполняется, память растёт.
-
-Очень большой буфер (100 000):
-
-  Source: ████████████████████████
-  Enrich: ████░░░░░░░░░░░░░░░░░░░░
-  
-  OOM через минуту.
-```
-
-### Как выбрать размер буфера
-
-**Правило:** буфер должен **сглаживать пики**, но **не скрывать** проблему.
-
-**Рекомендации:**
-
-- **1-10× пропускная способность стадии.** Если стадия обрабатывает 1000/сек, буфер 100-10 000.
-- **Не больше 10 000.** Иначе backpressure не работает.
-- **Мониторь длину буфера.** Если постоянно полный — стадия медленная.
-
-### Альтернатива: `select` с `default`
-
-**Без блокировки:**
-
-```go
-select {
-case out <- msg:
-case <-ctx.Done():
-    return
-default:
-    // буфер полон — пропускаем или логируем
-    metrics.Dropped.Add(1)
-}
-```
-
-**Что делает:** если буфер полон, сообщение **пропускается**. Это **не backpressure**, а **drop**.
-
-**Когда использовать:** если сообщения **можно терять** (метрики, логи).
-
-### Аннотация сложности
-
-| Размер буфера | Backpressure | Память | Когда |
-|:---|:---|:---|:---|
-| 1 | Мгновенный | Минимум | Синхронная обработка |
-| 10-100 | Быстрый | Мало | Большинство случаев |
-| 1000-10000 | Отложенный | Средне | Пики нагрузки |
-| 100000+ | Не работает | Много | ❌ Не использовать |
-
-### 💡 Практика: как настроить backpressure
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Буфер 10-1000** для большинства случаев.
-2. **Мониторь длину буфера.**
-3. **Backpressure** — для критичных данных.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **`select` с `default`** — для некритичных данных.
-5. **Drop метрики** — сколько потеряно.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не ставь буфер 100 000+.** Backpressure не работает.
-7. **Не игнорируй заполненный буфер.** Это сигнал.
-
-### Ключевые выводы подглавы 8.5
-
-- **Backpressure** — медленная стадия замедляет быструю.
-- **Размер буфера** определяет, как быстро работает backpressure.
-- **Маленький буфер** — быстрый backpressure. **Большой** — отложенный.
-- **`select` с `default`** — drop вместо backpressure.
-- **Мониторь длину буфера.**
-
----
-
-## 8.6 Закрытие каналов в pipeline
-
-Разберём **правильное закрытие** каналов в pipeline.
-
-### Правило: кто пишет — тот закрывает
-
-**В pipeline** каждая стадия:
-
-- **Читает** из входного канала.
-- **Пишет** в выходной канал.
-- **Закрывает** свой **выходной** канал.
-
-**Не закрывает входной** — это делает предыдущая стадия.
-
-### Пример
-
-```go
-func stage(ctx context.Context, input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)  // ← закрываем СВОЙ выход
-		for v := range input {  // ← читаем из чужого входа
-			select {
-			case out <- process(v):
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-```
-
-**Что происходит:**
-
-1. Стадия читает из `input`.
-2. Когда `input` закрыт — `for range` завершается.
-3. `defer close(out)` закрывает выход.
-4. Следующая стадия видит `close` и завершается.
-
-### Каскадное закрытие
-
-```
-Source закрывает source
-    ↓
-Stage 1: for range source завершается → close(stage1Out)
-    ↓
-Stage 2: for range stage1Out завершается → close(stage2Out)
-    ↓
-Stage 3: for range stage2Out завершается → close(stage3Out)
-    ↓
-Sink: for range stage3Out завершается
-```
-
-**Ключевое:** закрытие **каскадное**. Каждая стадия закрывает свой выход, что триггерит закрытие следующей.
-
-### Проблема: fan-out
-
-**Fan-out:** N воркеров читают из **одного** входа. Кто закроет **выходы** воркеров?
-
-**Решение:**
-
-- Каждый воркер закрывает **свой** выход (`defer close(workerOut)`).
-- Если воркеры пишут в **общий** выход — `wg.Wait()` + `close(out)`.
-
-```go
-func enrichStage(ctx context.Context, input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				select {
-				case out <- enrich(ctx, v):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-### Проблема: забыть close
-
-**❌ Плохо:**
-
-```go
-func stage(input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		for v := range input {
-			out <- process(v)
-		}
-		// забыли close(out)
-	}()
-
-	return out
-}
-```
-
-**Что происходит:** следующая стадия (`for range out`) **никогда не завершится**. **Утечка горутин.**
-
-### Проблема: закрыть вход
-
-**❌ Плохо:**
-
-```go
-func stage(input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		defer close(input)  // ← НЕЛЬЗЯ!
-		for v := range input {
-			out <- process(v)
-		}
-	}()
-
-	return out
-}
-```
-
-**Что происходит:** `close(input)` закроет канал, который **читает другая стадия**. Паника при отправке в закрытый канал.
-
-### Проблема: двойное закрытие
-
-**❌ Плохо:**
-
-```go
-go func() {
-	defer close(out)
-	for v := range input {
-		out <- process(v)
-	}
-	close(out)  // ← паника: close of closed channel
-}()
-```
-
-### Аннотация сложности
-
-| Операция | Time | Space |
-|:---|:---|:---|
-| `close(ch)` | ~50-100 нс | 0 |
-| `for range ch` после close | ~50-100 нс на элемент | 0 |
-| `wg.Wait()` | ~10-20 нс + ожидание | 0 |
-
-### 💡 Практика: как закрывать каналы в pipeline
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Каждая стадия закрывает СВОЙ выход** (`defer close(out)`).
-2. **НЕ закрывай входной канал.**
-3. **Fan-out:** `wg.Wait()` + `close(out)`.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **`defer close(out)`** сразу после `make(chan)`.
-
-**❌ НЕ ДЕЛАЙ:**
-
-5. **Не забывай `close(out)`.** Утечка.
-6. **Не закрывай входной канал.**
-7. **Не закрывай канал дважды.** Паника.
-
-### Ключевые выводы подглавы 8.6
-
-- **Кто пишет — тот закрывает.** Каждая стадия закрывает **свой** выход.
-- **Не закрывай входной канал.**
-- **Каскадное закрытие.**
-- **Fan-out:** `wg.Wait()` + `close(out)`.
-- **Забыть close** → утечка. **Двойное close** → паника.
-
----
-
-## 8.7 Отмена pipeline через context
-
-Разберём **отмену** pipeline через `context.Context`.
-
-### Паттерн: `context` во всех стадиях
-
-```go
-func stage(ctx context.Context, input <-chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case v, ok := <-input:
-				if !ok {
-					return
-				}
-				select {
-				case out <- process(v):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-
-	return out
-}
-```
-
-**Что происходит:**
-
-1. Проверка `ctx.Done()` в **двух** местах: при чтении из входа и при записи в выход.
-2. Если `ctx` отменён — стадия завершается.
-3. `defer close(out)` закрывает выход.
-
-### Каскадная отмена
-
-```
-ctx отменён
-    ↓
-Source: select case <-ctx.Done() → return
-    ↓
-Stage 1: select case <-ctx.Done() → return → close(stage1Out)
-    ↓
-Stage 2: select case <-ctx.Done() → return → close(stage2Out)
-    ↓
-Sink: select case <-ctx.Done() → return
-```
-
-**Ключевое:** `ctx.Done()` — **broadcast**. Все стадии видят отмену **одновременно**.
-
-### Полный пример с отменой
+- Каждая отправка в канал проходит через `select`.
+- Если `ctx` отменён — generator завершается.
+- `defer close(out)` закрывает канал.
+
+### Потребитель
 
 ```go
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	source := generator(ctx, []int{1, 2, 3, 4, 5})
-	parsed := parseStage(ctx, source)
-	enriched := enrichStage(ctx, parsed, 5)
-
-	for range enriched {
-		// ждём завершения
-	}
-
-	if ctx.Err() != nil {
-		fmt.Println("pipeline canceled:", ctx.Err())
-	}
+    ctx, cancel := context.WithCancel(context.Background())
+    
+    for v := range numbersCtx(ctx, 1_000_000) {
+        if v > 10 {
+            cancel()  // отменяем generator
+            break
+        }
+        fmt.Println(v)
+    }
+    
+    // Даём время завершиться
+    time.Sleep(10 * time.Millisecond)
 }
 ```
 
-### `errgroup` для pipeline
+**Что происходит:**
+
+- При `v > 10` вызываем `cancel()`.
+- Generator видит `ctx.Done()` и завершается.
+- Утечки нет.
+
+### Паттерн: таймаут
 
 ```go
-g, ctx := errgroup.WithContext(context.Background())
-
-g.Go(func() error { return runSource(ctx, ...) })
-g.Go(func() error { return runParse(ctx, ...) })
-g.Go(func() error { return runEnrich(ctx, ...) })
-g.Go(func() error { return runWrite(ctx, ...) })
-
-if err := g.Wait(); err != nil {
-	fmt.Println("error:", err)
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+    defer cancel()
+    
+    for v := range numbersCtx(ctx, 1_000_000) {
+        fmt.Println(v)
+    }
+    // Через 1 секунду generator остановится
 }
 ```
-
-**Что делает `errgroup`:**
-
-- Запускает N горутин.
-- При **первой** ошибке — отменяет `ctx`.
-- `g.Wait()` возвращает первую ошибку.
-
-### Аннотация сложности
-
-| Подход | Отмена | Ошибок | Сложность |
-|:---|:---|:---|:---|
-| `context` + `cancel` | ✅ | Первая | Средняя |
-| `errgroup` | ✅ | Первая | Низкая |
-| Ручной `errCh` | ✅ | Первая | Средняя |
-
-### 💡 Практика: как отменять pipeline
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`context.Context`** во всех стадиях.
-2. **`select` с `ctx.Done()`** — при чтении и записи.
-3. **`errgroup`** — для обработки ошибок.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **`context.WithTimeout`** — для ограничения времени.
-
-**❌ НЕ ДЕЛАЙ:**
-
-5. **Не игнорируй `ctx.Done()`.** Отмена не сработает.
-6. **Не забывай `cancel()`.** Утечка.
-
-### Ключевые выводы подглавы 8.7
-
-- **`context.Context`** — для отмены pipeline.
-- **`select` с `ctx.Done()`** — при чтении и записи.
-- **Каскадная отмена:** `ctx.Done()` — broadcast.
-- **`errgroup`** — для обработки ошибок.
-
----
-
-## 8.8 Tee-канал и bridge-канал
-
-Разберём **tee-канал** и **bridge-канал**.
-
-### Tee-канал: разветвление
-
-**Tee-канал** — это канал, который **дублирует** данные в два канала.
-
-**Схема:**
-
-```
-                ┌──────────┐
-           ┌───▶│ Channel1 │
-┌──────┐   │    └──────────┘
-│Input │───┤
-└──────┘   │    ┌──────────┐
-           └───▶│ Channel2 │
-                └──────────┘
-```
-
-**Реализация:**
-
-```go
-func tee(ctx context.Context, input <-chan int) (chan int, chan int) {
-	out1 := make(chan int)
-	out2 := make(chan int)
-
-	go func() {
-		defer close(out1)
-		defer close(out2)
-		for v := range input {
-			select {
-			case out1 <- v:
-			case <-ctx.Done():
-				return
-			}
-			select {
-			case out2 <- v:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out1, out2
-}
-```
-
-**Что делает:**
-
-1. Читает из `input`.
-2. Отправляет сообщение в `out1`.
-3. Отправляет **то же** сообщение в `out2`.
-4. Закрывает оба канала при завершении.
-
-**Ключевое:** каждое сообщение **дублируется**.
-
-### Bridge-канал: склейка
-
-**Bridge-канал** — это канал, который **разворачивает** канал каналов в один канал.
-
-**Реализация:**
-
-```go
-func bridge(ctx context.Context, chanCh <-chan chan int) chan int {
-	out := make(chan int)
-
-	go func() {
-		defer close(out)
-		for {
-			var ch chan int
-			select {
-			case c, ok := <-chanCh:
-				if !ok {
-					return
-				}
-				ch = c
-			case <-ctx.Done():
-				return
-			}
-			for v := range ch {
-				select {
-				case out <- v:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-
-	return out
-}
-```
-
-**Что делает:**
-
-1. Читает из `chanCh` (канал каналов).
-2. Для каждого вложенного канала — читает из него и пишет в `out`.
-3. Когда `chanCh` закрыт — завершается.
-
-### Сравнение tee и bridge
-
-| Паттерн | Что делает | Использование |
-|:---|:---|:---|
-| **Tee** | Дублирует в 2 канала | Логирование + обработка |
-| **Bridge** | Разворачивает `chan chan T` | Динамический fan-in |
-
-### Аннотация сложности
-
-| Паттерн | Горутин | Time (per element) |
-|:---|:---|:---|
-| Tee | 1 | ~100-200 нс |
-| Bridge | 1 | ~50-100 нс |
-
-### 💡 Практика: как использовать tee и bridge
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Tee** — для дублирования в 2 канала.
-2. **Bridge** — для динамического fan-in.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-3. **`context` для отмены** в tee и bridge.
-
-**❌ НЕ ДЕЛАЙ:**
-
-4. **Не путай tee с fan-out.** Tee дублирует, fan-out распределяет.
-5. **Не путай bridge с merge.** Bridge разворачивает `chan chan T`, merge сливает N каналов.
-
-### Ключевые выводы подглавы 8.8
-
-- **Tee** — дублирование в 2 канала.
-- **Bridge** — разворачивание `chan chan T` в `chan T`.
-- **Tee** — для логирования + обработки.
-- **Bridge** — для динамического fan-in.
-
----
-
-## 8.9 Pipeline vs worker pool: что выбрать
-
-Разберём **когда что использовать**.
-
-### Worker pool
-
-**Worker pool** — N воркеров обрабатывают **однотипные** задачи.
-
-**Когда использовать:**
-
-- **Однотипная обработка.**
-- **Одна стадия.**
-- **Простота важна.**
-
-### Pipeline
-
-**Pipeline** — цепочка стадий, каждая обрабатывает **по-своему**.
-
-**Когда использовать:**
-
-- **Разные стадии.** Парсинг → обогащение → запись.
-- **Разные N на стадиях.**
-- **Backpressure между стадиями.**
-
-### Гибрид: pipeline из worker pool'ов
-
-**Каждая стадия pipeline** — это worker pool:
-
-```go
-func stage(ctx context.Context, input <-chan int, n int) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				select {
-				case out <- process(ctx, v):
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-```
-
-### Сравнение
-
-| Аспект | Worker pool | Pipeline |
-|:---|:---|:---|
-| Стадий | 1 | N |
-| Тип задач | Однотипные | Разные |
-| N | Фиксировано | Разное на стадиях |
-| Backpressure | Внутри pool | Между стадиями |
-| Сложность | Низкая | Средняя |
-
-### 💡 Практика: как выбирать
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Worker pool** — для однотипной обработки.
-2. **Pipeline** — для разных стадий.
-3. **Гибрид** — pipeline из worker pool'ов.
-
-**❌ НЕ ДЕЛАЙ:**
-
-4. **Не используй pipeline для одной стадии.** Worker pool проще.
-5. **Не используй worker pool для разных стадий.** Pipeline лучше.
-
-### Ключевые выводы подглавы 8.9
-
-- **Worker pool** — однотипная обработка, одна стадия.
-- **Pipeline** — разные стадии, разное N.
-- **Гибрид** — pipeline из worker pool'ов.
-
----
-
-## 8.10 Практика Go: pipeline с метриками
-
-Напишем **pipeline с метриками**.
 
 ### Полный код
 
@@ -2456,463 +432,863 @@ func stage(ctx context.Context, input <-chan int, n int) chan int {
 package main
 
 import (
-	"context"
-	"fmt"
-	"sync"
-	"sync/atomic"
-	"time"
+    "context"
+    "fmt"
+    "time"
 )
 
-type Metrics struct {
-	SourceCount   atomic.Int64
-	ParsedCount   atomic.Int64
-	EnrichedCount atomic.Int64
-
-	SourceDuration   atomic.Int64
-	ParseDuration    atomic.Int64
-	EnrichDuration   atomic.Int64
+func numbersCtx(ctx context.Context, n int) <-chan int {
+    out := make(chan int)
+    
+    go func() {
+        defer close(out)
+        for i := 0; i < n; i++ {
+            select {
+            case out <- i:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    
+    return out
 }
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	var metrics Metrics
-
-	data := make([]int, 1000)
-	for i := range data {
-		data[i] = i
-	}
-
-	source := generator(ctx, data, &metrics)
-	parsed := parseStage(ctx, source, &metrics)
-	enriched := enrichStage(ctx, parsed, 10, &metrics)
-
-	for range enriched {
-		// ждём
-	}
-
-	fmt.Printf("Source:   %d\n", metrics.SourceCount.Load())
-	fmt.Printf("Parsed:   %d\n", metrics.ParsedCount.Load())
-	fmt.Printf("Enriched: %d\n", metrics.EnrichedCount.Load())
-	fmt.Printf("Source avg:  %v\n", avgDuration(&metrics.SourceDuration, &metrics.SourceCount))
-	fmt.Printf("Parse avg:   %v\n", avgDuration(&metrics.ParseDuration, &metrics.ParsedCount))
-	fmt.Printf("Enrich avg:  %v\n", avgDuration(&metrics.EnrichDuration, &metrics.EnrichedCount))
-}
-
-func avgDuration(total, count *atomic.Int64) time.Duration {
-	c := count.Load()
-	if c == 0 {
-		return 0
-	}
-	return time.Duration(total.Load() / c)
-}
-
-func generator(ctx context.Context, data []int, metrics *Metrics) chan int {
-	out := make(chan int, 100)
-
-	go func() {
-		defer close(out)
-		for _, v := range data {
-			start := time.Now()
-			select {
-			case out <- v:
-				metrics.SourceCount.Add(1)
-				metrics.SourceDuration.Add(int64(time.Since(start)))
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func parseStage(ctx context.Context, input <-chan int, metrics *Metrics) chan int {
-	out := make(chan int, 100)
-
-	go func() {
-		defer close(out)
-		for v := range input {
-			start := time.Now()
-			parsed := parse(v)
-			select {
-			case out <- parsed:
-				metrics.ParsedCount.Add(1)
-				metrics.ParseDuration.Add(int64(time.Since(start)))
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func parse(v int) int {
-	return v * 2
-}
-
-func enrichStage(ctx context.Context, input <-chan int, n int, metrics *Metrics) chan int {
-	out := make(chan int)
-
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for v := range input {
-				start := time.Now()
-				enriched := enrich(ctx, v)
-				select {
-				case out <- enriched:
-					metrics.EnrichedCount.Add(1)
-					metrics.EnrichDuration.Add(int64(time.Since(start)))
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
-}
-
-func enrich(ctx context.Context, v int) int {
-	time.Sleep(1 * time.Millisecond)
-	return v + 100
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    for v := range numbersCtx(ctx, 1_000_000) {
+        if v > 10 {
+            cancel()
+            break
+        }
+        fmt.Println(v)
+    }
+    
+    time.Sleep(10 * time.Millisecond)
+    fmt.Println("done")
 }
 ```
 
-### Пример вывода
+**Пример вывода:**
 
 ```
-Source:   1000
-Parsed:   1000
-Enriched: 1000
-Source avg:  1.2µs
-Parse avg:   800ns
-Enrich avg:  1.1ms
+0
+1
+...
+10
+done
 ```
 
-### Аннотация сложности
+### Схема
 
-| Стадия | Time (per msg) | Пропускная способность |
-|:---|:---|:---|
-| Source | 1.2 µs | 833 000/сек |
-| Parse | 800 нс | 1 250 000/сек |
-| Enrich | 1.1 мс × 10 | 9 000/сек |
+```
+Generator:
+  for i := 0; i < n; i++ {
+    select {
+    case out <- i:        ← отправили
+    case <-ctx.Done():    ← отмена
+      return
+    }
+  }
 
-### 💡 Практика: как измерять pipeline
+Потребитель:
+  for v := range ch {
+    if v > 10 {
+      cancel()  ────────► Generator видит ctx.Done()
+      break
+    }
+  }
+```
+
+### 💡 Практика: как добавить context
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Метрики на каждой стадии:** count, duration.
-2. **`atomic.Int64`** для метрик.
+1. **`ctx context.Context` — первый аргумент:**
+   ```go
+   func generator(ctx context.Context, ...) <-chan T
+   ```
+
+2. **`select` с `ctx.Done()` при отправке:**
+   ```go
+   select {
+   case out <- v:
+   case <-ctx.Done():
+       return
+   }
+   ```
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-3. **Экспорт в Prometheus** (для production).
+3. **`defer cancel()` у потребителя.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-4. **Не используй `Mutex` для метрик** — `atomic` быстрее.
-
-### Ключевые выводы подглавы 8.10
-
-- **Метрики на каждой стадии:** count, duration.
-- **`atomic.Int64`** для счётчиков.
-- **Bottleneck** видно по метрикам.
+4. **Не пиши в канал без `select` в долгоживущем generator.**
+5. **Не забывай `cancel()`.**
 
 ---
 
-## 8.11 Выводы и типичные ошибки
+## 8.4 Generator с ошибками
+
+Generator может столкнуться с ошибкой при чтении. Как её передать потребителю?
+
+### Простой способ: Result с ошибкой
+
+```go
+type Result[T any] struct {
+    Value T
+    Err   error
+}
+
+func generatorWithErr(ctx context.Context) <-chan Result[string] {
+    out := make(chan Result[string])
+    
+    go func() {
+        defer close(out)
+        for {
+            v, err := readNext(ctx)
+            select {
+            case out <- Result[string]{Value: v, Err: err}:
+            case <-ctx.Done():
+                return
+            }
+            if err != nil {
+                return
+            }
+        }
+    }()
+    
+    return out
+}
+```
+
+**Что происходит:**
+
+- Каждый элемент канала — `Result{Value, Err}`.
+- Потребитель проверяет `Err`.
+- При ошибке generator **завершается** (после отправки).
+
+### Потребитель
+
+```go
+for r := range generatorWithErr(ctx) {
+    if r.Err != nil {
+        log.Println("error:", r.Err)
+        break
+    }
+    process(r.Value)
+}
+```
+
+**Что происходит:**
+
+- Если ошибка — логируем и выходим.
+- Иначе — обрабатываем значение.
+
+### Схема
+
+```
+Generator:
+  for {
+    v, err := readNext(ctx)
+    out <- Result{v, err}
+    if err != nil {
+      return
+    }
+  }
+
+Потребитель:
+  for r := range ch {
+    if r.Err != nil {
+      // обработка
+      break
+    }
+    process(r.Value)
+  }
+```
+
+### Альтернатива: отдельный канал ошибок
+
+```go
+func generatorWithErrCh(ctx context.Context) (<-chan string, <-chan error) {
+    out := make(chan string)
+    errCh := make(chan error, 1)
+    
+    go func() {
+        defer close(out)
+        defer close(errCh)
+        for {
+            v, err := readNext(ctx)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            select {
+            case out <- v:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    
+    return out, errCh
+}
+```
+
+**Что происходит:**
+
+- Данные идут в `out`.
+- Ошибки идут в `errCh`.
+- Потребитель читает из обоих каналов.
+
+**Плюсы:** чище — значения не заворачиваются в `Result`.
+
+**Минусы:** нужно читать из двух каналов — либо через `select`, либо в отдельных горутинах.
+
+### Что выбрать
+
+| Способ | Когда |
+|:---|:---|
+| `Result[T]{Value, Err}` | Простой случай, ошибок мало |
+| Отдельный `errCh` | Часто ошибки, сложная логика |
+
+**Рекомендация:** для простых generator — `Result`. Для сложных pipeline — отдельные каналы.
+
+### 💡 Практика: как передавать ошибки
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`Result[T]{Value, Err}` для простых случаев.**
+2. **При ошибке — `return` после отправки.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Отдельный `errCh` для сложных pipeline.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не игнорируй ошибки в generator.**
+5. **Не паникуй при ошибке — передавай через канал.**
+
+---
+
+## 8.5 Generator с backpressure
+
+Backpressure — это когда генератор **не может** писать быстрее, чем потребитель читает. В Go это работает **автоматически** через небуферизованный канал.
+
+### Небуферизованный канал = backpressure
+
+```go
+out := make(chan int)  // ← небуферизованный
+```
+
+**Что происходит:**
+
+- Generator пытается писать в канал.
+- Если потребитель не готов читать — generator **блокируется**.
+- Generator работает со скоростью потребителя.
+
+**Это и есть backpressure.**
+
+### Буферизованный канал = нет backpressure
+
+```go
+out := make(chan int, 100)  // ← буфер на 100
+```
+
+**Что происходит:**
+
+- Generator пишет в буфер.
+- Пока буфер не полон — generator **не блокируется**.
+- Только когда буфер полон — generator блокируется.
+
+**Backpressure отложен.** Если producer быстрее consumer — буфер заполняется. Когда полон — generator всё равно блокируется.
+
+### Пример: быстрый generator, медленный потребитель
+
+```go
+func fastGen() <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for i := 0; i < 100; i++ {
+            out <- i  // ← блокируется, пока не прочитают
+        }
+    }()
+    return out
+}
+
+func main() {
+    for v := range fastGen() {
+        time.Sleep(100 * time.Millisecond)  // ← медленный потребитель
+        fmt.Println(v)
+    }
+}
+```
+
+**Что происходит:**
+
+- Generator пишет число, блокируется.
+- Потребитель спит 100 мс, читает, обрабатывает.
+- Generator пишет следующее.
+- **Generator работает со скоростью потребителя.**
+
+### Пример: буферизованный generator
+
+```go
+func bufferedGen() <-chan int {
+    out := make(chan int, 10)  // ← буфер 10
+    go func() {
+        defer close(out)
+        for i := 0; i < 100; i++ {
+            out <- i
+        }
+    }()
+    return out
+}
+```
+
+**Что происходит:**
+
+- Generator пишет 10 чисел в буфер и продолжает.
+- Когда буфер полон — блокируется.
+- Потребитель медленный — буфер остаётся полным.
+- **Отличие:** генератор имеет «запас» на 10 чисел.
+
+### Когда какой буфер
+
+| Сценарий | Буфер |
+|:---|:---|
+| Важен backpressure | 0 (небуферизованный) |
+| Сгладить пики | 10–100 |
+| Большой запас | 1000+ |
+| Огромный запас | ❌ Маскирует проблему |
+
+**Рекомендация:** начинай с небуферизованного. Если нужен «запас» — добавляй буфер 10–100.
+
+### 💡 Практика: как использовать backpressure
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Небуферизованный канал** — для автоматического backpressure.
+2. **Буфер 10–100** — если нужен небольшой запас.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Мониторь длину буфера** — если растёт, потребитель медленный.
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не ставь буфер 100 000+.** Backpressure не работает.
+5. **Не игнорируй растущий буфер.**
+
+---
+
+## 8.6 В связке с другими паттернами
+
+Generator — базовая часть pipeline. Разберём, как он комбинируется с другими паттернами.
+
+### Generator + fan-out
+
+Generator отдаёт данные, fan-out распределяет их между воркерами:
+
+```go
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    source := numbersCtx(ctx, 100)
+    
+    const workers = 5
+    var wg sync.WaitGroup
+    for i := 0; i < workers; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            for v := range source {  // ← читают из одного канала
+                fmt.Printf("Worker %d: %d\n", id, v)
+            }
+        }(i)
+    }
+    
+    wg.Wait()
+}
+```
+
+**Что происходит:**
+
+- Generator отдаёт числа.
+- 5 воркеров читают из **одного** канала.
+- Распределение автоматическое.
+
+### Generator + fan-in
+
+Несколько generator'ов сливаются в один канал:
+
+```go
+func merge(ctx context.Context, channels ...<-chan int) <-chan int {
+    out := make(chan int)
+    
+    var wg sync.WaitGroup
+    for _, ch := range channels {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for v := range c {
+                select {
+                case out <- v:
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }(ch)
+    }
+    
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+    
+    return out
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    ch1 := numbersCtx(ctx, 5)
+    ch2 := numbersCtx(ctx, 5)
+    
+    for v := range merge(ctx, ch1, ch2) {
+        fmt.Println(v)
+    }
+}
+```
+
+**Что происходит:**
+
+- Два generator'а отдают числа.
+- `merge` сливает в один канал.
+- Потребитель читает из одного канала.
+
+### Generator + pipeline
+
+Generator — первая стадия pipeline:
+
+```go
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    source := numbersCtx(ctx, 10)
+    doubled := doubleStage(ctx, source)
+    filtered := filterEvenStage(ctx, doubled)
+    
+    for v := range filtered {
+        fmt.Println(v)
+    }
+}
+
+func doubleStage(ctx context.Context, in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for v := range in {
+            select {
+            case out <- v * 2:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    return out
+}
+
+func filterEvenStage(ctx context.Context, in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for v := range in {
+            if v%2 == 0 {
+                select {
+                case out <- v:
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }
+    }()
+    return out
+}
+```
+
+**Что происходит:**
+
+- `numbersCtx` — generator.
+- `doubleStage` — стадия pipeline.
+- `filterEvenStage` — стадия pipeline.
+- Потребитель читает из последней стадии.
+
+### Схема
+
+```
+┌──────────┐   ┌────────┐   ┌──────────┐
+│Generator │──▶│ Double │──▶│  Filter  │──▶ Потребитель
+└──────────┘   └────────┘   └──────────┘
+```
+
+### 💡 Практика: как комбинировать generator
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Generator — первая стадия pipeline.**
+2. **`context` — через все стадии.**
+3. **`close` — в каждой стадии.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Разбивай логику на маленькие стадии.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не смешивай generator и обработку в одной функции.**
+
+---
+
+## 8.7 Практика Go: генераторы данных
+
+Разберём **четыре примера**.
+
+### Пример 1: генератор Фибоначчи
+
+```go
+func fibonacci(ctx context.Context) <-chan int {
+    out := make(chan int)
+    
+    go func() {
+        defer close(out)
+        a, b := 0, 1
+        for {
+            select {
+            case out <- a:
+                a, b = b, a+b
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    
+    return out
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    for v := range fibonacci(ctx) {
+        if v > 100 {
+            cancel()
+            break
+        }
+        fmt.Println(v)
+    }
+}
+```
+
+**Пример вывода:**
+
+```
+0
+1
+1
+2
+3
+5
+8
+13
+21
+34
+55
+89
+```
+
+**Что видно:** generator отдаёт **бесконечную** последовательность. Потребитель прерывает через `cancel()`.
+
+### Пример 2: генератор из API с пагинацией
+
+```go
+func paginatedAPI(ctx context.Context, baseURL string) <-chan User {
+    out := make(chan User)
+    
+    go func() {
+        defer close(out)
+        page := 1
+        for {
+            users, err := fetchPage(ctx, baseURL, page)
+            if err != nil {
+                return
+            }
+            if len(users) == 0 {
+                return
+            }
+            for _, u := range users {
+                select {
+                case out <- u:
+                case <-ctx.Done():
+                    return
+                }
+            }
+            page++
+        }
+    }()
+    
+    return out
+}
+```
+
+**Что демонстрирует:** generator сам управляет пагинацией. Потребитель читает пользователей одного за другим.
+
+### Пример 3: генератор с ошибками
+
+```go
+type Result struct {
+    Line string
+    Err  error
+}
+
+func fileLines(ctx context.Context, path string) <-chan Result {
+    out := make(chan Result)
+    
+    go func() {
+        defer close(out)
+        f, err := os.Open(path)
+        if err != nil {
+            out <- Result{Err: err}
+            return
+        }
+        defer f.Close()
+        
+        scanner := bufio.NewScanner(f)
+        for scanner.Scan() {
+            select {
+            case out <- Result{Line: scanner.Text()}:
+            case <-ctx.Done():
+                return
+            }
+        }
+        if err := scanner.Err(); err != nil {
+            select {
+            case out <- Result{Err: err}:
+            case <-ctx.Done():
+            }
+        }
+    }()
+    
+    return out
+}
+
+func main() {
+    ctx := context.Background()
+    for r := range fileLines(ctx, "data.txt") {
+        if r.Err != nil {
+            log.Println("error:", r.Err)
+            break
+        }
+        fmt.Println(r.Line)
+    }
+}
+```
+
+**Что демонстрирует:** ошибка передаётся через тот же канал. Потребитель её видит и завершается.
+
+### Пример 4: generator + worker pool
+
+```go
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    source := numbersCtx(ctx, 100)
+    
+    // Fan-out: 5 воркеров
+    const workers = 5
+    var wg sync.WaitGroup
+    for i := 0; i < workers; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            for v := range source {
+                // обработка
+                time.Sleep(10 * time.Millisecond)
+                fmt.Printf("Worker %d: %d\n", id, v)
+            }
+        }(i)
+    }
+    
+    wg.Wait()
+    fmt.Println("done")
+}
+```
+
+**Что демонстрирует:** generator + fan-out. 5 воркеров читают из одного канала.
+
+### 💡 Практика: как писать generator
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`ctx` для отмены.**
+2. **`defer close(out)` сразу после `make(chan)`.**
+3. **`select` с `ctx.Done()` при отправке.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **`Result{Value, Err}` для передачи ошибок.**
+5. **Проверяй `scanner.Err()` для файлов.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не забывай `close`.**
+7. **Не паникуй при ошибке — передавай через канал.**
+
+---
+
+## 8.8 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-Fan-out — распределение работы от одного источника к N обработчикам. **Две реализации:** A (N каналов) и B (один общий канал). Fan-in — слияние N каналов в один. Fan-out + fan-in — классическая комбинация. Pipeline — цепочка стадий. Backpressure — медленная стадия замедляет быструю. Закрытие: кто пишет — тот закрывает. Отмена через `context`. Tee — дублирование. Bridge — разворачивание `chan chan T`. Worker pool для однотипной, pipeline для разных стадий. Гибрид — pipeline из worker pool'ов.
+Generator — это функция, которая отдаёт данные в канал. Возвращает `<-chan T`, запускает горутину, закрывает канал при завершении. Простейший generator не умеет останавливаться — для этого нужен `context`. Ошибки передаются через `Result{Value, Err}` или отдельный канал. Backpressure работает **автоматически** через небуферизованный канал. Generator — первая стадия pipeline; комбинируется с fan-out, fan-in, pipeline.
 
 **Типичные ошибки:**
 
-- ❌ **Использовать `i--` при `!ok`.** Busy loop. Используй `received` + `ch = nil`.
-- ❌ **Забыть `close(out)` в стадии.** Утечка горутин.
-- ❌ **Закрыть входной канал.** Паника при отправке.
-- ❌ **Двойное закрытие.** Паника.
-- ❌ **Не использовать `select` с `ctx.Done()`.** Отмена не сработает.
-- ❌ **Большие буферы.** Backpressure не работает.
-- ❌ **Забыть `wg.Wait()` в fan-in.** `close(out)` не выполнится.
-- ❌ **Путать fan-out и fan-in.**
-- ❌ **Путать tee и fan-out.**
-- ❌ **Путать bridge и merge.**
-- ❌ **Передавать `ch` в замыкание**, а не аргумент. Все горутины читают из последнего.
-- ❌ **Создавать N + 1 каналов, когда можно одним.**
+- ❌ **Забыть `defer close(out)`.** Потребитель зависнет.
+- ❌ **Не использовать `context`.** Утечка при выходе потребителя.
+- ❌ **Писать в канал без `select` с `ctx.Done()`.** Generator не остановится.
+- ❌ **Возвращать `chan T` вместо `<-chan T`.** Потребитель может писать.
+- ❌ **Игнорировать ошибки.** Теряются.
+- ❌ **Паниковать при ошибке.** Роняет программу.
+- ❌ **Огромный буфер.** Маскирует медленного потребителя.
+- ❌ **Не проверять `scanner.Err()`.** Ошибки чтения теряются.
+- ❌ **Смешивать generator и обработку.** Сложно тестировать.
 
 ---
 
-## 8.12 Для быстрого повторения
+## 8.9 Для быстрого повторения
 
-- **Fan-out** — распределение работы от одного источника к N обработчикам.
-- **Реализация A:** N каналов результатов. **Горутин:** 2N + 1.
-- **Реализация B:** один общий канал. **Горутин:** N + 2.
-- **Fan-in** — слияние N каналов в один. **Горутин:** N + 1.
-- **Fan-out + fan-in** — классическая комбинация. **Горутин:** 2N + 3.
-- **Fan-out B** — проще и быстрее для большинства случаев.
-- **Отключение закрытых каналов через `ch = nil`**, не через `i--`.
-- **Pipeline** — цепочка стадий. Каждая — `func(ctx, input) chan T`.
-- **Backpressure** — медленная стадия замедляет быструю.
-- **Маленький буфер** — быстрый backpressure. **Большой** — отложенный.
-- **Закрытие:** кто пишет — тот закрывает. Каскадное.
-- **Fan-out:** `wg.Wait()` + `close(out)`.
-- **Отмена:** `context` + `select` с `ctx.Done()`.
-- **Tee** — дублирование в 2 канала.
-- **Bridge** — разворачивание `chan chan T`.
-- **Worker pool vs pipeline:** pool для однотипной, pipeline для разных стадий.
-- **Метрики:** count + duration на каждой стадии.
+- **Generator** — функция, возвращающая `<-chan T`.
+- **Запускает горутину**, пишет в канал, закрывает по завершении.
+- **`defer close(out)`** — сразу после `make(chan)`.
+- **`context`** — для отмены. `select` с `ctx.Done()` при отправке.
+- **Ошибки:** `Result{Value, Err}` или отдельный канал.
+- **Backpressure** — автоматически через небуферизованный канал.
+- **Буфер 10–100** — для небольшого запаса.
+- **Generator — первая стадия pipeline.**
+- **Fan-out** — N воркеров читают из одного канала generator.
+- **Fan-in** — merge нескольких generator'ов.
+- **Возвращай `<-chan T`**, не `chan T`.
 
 ---
 
-## 8.13 Вопросы для самопроверки
+## 8.10 Вопросы для самопроверки
 
-1. Что такое fan-out? Назови две реализации.
-2. Чем реализация A отличается от B?
-3. Что такое fan-in? Как реализуется?
-4. Почему `ch` передаётся как аргумент, а не замыкание?
-5. Почему `close(out)` в отдельной горутине?
-6. Что такое pipeline? Как реализуется?
-7. Что такое backpressure? Как размер буфера влияет на него?
-8. Почему большой буфер маскирует проблему?
-9. Что делает `select` с `default`?
-10. Как отменить pipeline через `context`?
-11. Что такое tee-канал?
-12. Что такое bridge-канал?
-13. Чем tee отличается от fan-out?
-14. Чем bridge отличается от merge?
-15. Когда worker pool, а когда pipeline?
-16. Как исправить баг с `i--`?
-17. Почему `ch = nil` отключает case в select?
-18. Как измерять метрики pipeline?
+1. Что такое generator? Какую задачу решает?
+2. Как построить простейший generator?
+3. Зачем нужен `context` в generator?
+4. Как передавать ошибки из generator?
+5. Как работает backpressure в generator?
+6. Как комбинировать generator с fan-out?
+7. Что будет, если потребитель перестанет читать из generator без `context`?
 
 ---
 
-## 8.14 Ответы
+## 8.11 Ответы
 
 ### Ответ 1
 
-**Fan-out** — распределение работы от одного источника к N обработчикам.
-
-**Две реализации:**
-- **A:** N каналов результатов (каждый воркер пишет в свой).
-- **B:** один общий канал результатов (все воркеры пишут в один).
+**Generator** — функция, которая отдаёт данные в канал. Решает задачу **развязки** источника и обработчика: generator знает только «как читать», потребитель — «как обрабатывать».
 
 ### Ответ 2
 
-**A:** N каналов, 2N горутин, гибко, высокий contention.
-
-**B:** один канал, N + 2 горутин, просто, низкий contention.
+```go
+func numbers(n int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for i := 0; i < n; i++ {
+            out <- i
+        }
+    }()
+    return out
+}
+```
 
 ### Ответ 3
 
-**Fan-in** — слияние N каналов в один.
-
-**Реализация:** N горутин + 1 для close.
-
-```go
-func fanIn(channels ...<-chan int) chan int {
-	out := make(chan int)
-	var wg sync.WaitGroup
-	for _, ch := range channels {
-		wg.Add(1)
-		go func(c <-chan int) {
-			defer wg.Done()
-			for v := range c {
-				out <- v
-			}
-		}(ch)
-	}
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-	return out
-}
-```
+**`context`** позволяет остановить generator досрочно. Без него, если потребитель перестал читать, generator **зависнет** на отправке в канал. **Утечка горутины.**
 
 ### Ответ 4
 
-**`ch` передаётся как аргумент**, потому что иначе все горутины захватят **последнее** значение `ch` из цикла. Все будут читать из **одного** канала.
-
-```go
-// ❌ Плохо:
-for _, ch := range channels {
-	go func() {
-		for v := range ch {  // все читают из последнего ch
-			...
-		}
-	}()
-}
-
-// ✅ Хорошо:
-for _, ch := range channels {
-	go func(c <-chan int) {  // копия ch
-		for v := range c {
-			...
-		}
-	}(ch)
-}
-```
+**Два способа:**
+1. `Result{Value, Err}` — каждый элемент несёт ошибку.
+2. Отдельный канал `errCh` — данные в одном канале, ошибки в другом.
 
 ### Ответ 5
 
-**`close(out)` в отдельной горутине**, потому что:
-- `wg.Wait()` блокируется.
-- Если `close(out)` в main — main ждёт, `out` не закрыт.
-- Читатели `out` (в main) зависнут.
-- Отдельная горутина ждёт `wg.Wait()` и закрывает `out` **параллельно**.
+**Backpressure** работает **автоматически** через небуферизованный канал. Generator пишет в канал, блокируется, пока потребитель не прочитает. Generator работает со скоростью потребителя.
 
 ### Ответ 6
 
-**Pipeline** — цепочка стадий, каждая читает из входа и пишет в выход.
+**Generator + fan-out:**
 
 ```go
-source := generator(ctx, data)
-parsed := parseStage(ctx, source)
-enriched := enrichStage(ctx, parsed, 5)
+source := numbersCtx(ctx, 100)
+for i := 0; i < 5; i++ {
+    go func() {
+        for v := range source {  // читают из одного канала
+            process(v)
+        }
+    }()
+}
 ```
+
+5 воркеров читают из **одного** канала generator.
 
 ### Ответ 7
 
-**Backpressure** — медленная стадия замедляет быструю.
+**Без `context`:** generator **зависнет** на `out <- v`. Горутина не завершится. **Утечка.** Канал не закроется.
 
-**Размер буфера:**
-- Маленький (1-10) — быстрый backpressure.
-- Большой (1000) — отложенный.
-- 100 000+ — не работает.
-
-### Ответ 8
-
-**Большой буфер маскирует проблему**, потому что producer и воркеры не блокируются, пока буфер не полон. Но если producer быстрее collector надолго — буферы переполнятся.
-
-### Ответ 9
-
-**`select` с `default`** — если буфер полон, сообщение **пропускается** (drop). Для некритичных данных.
-
-### Ответ 10
-
-**Отмена pipeline через `context`:**
-
-```go
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-// В каждой стадии:
-select {
-case <-ctx.Done():
-	return
-case out <- process(v):
-}
-```
-
-### Ответ 11
-
-**Tee-канал** — дублирует данные в 2 канала.
-
-```go
-func tee(ctx context.Context, input <-chan int) (chan int, chan int) {
-	out1 := make(chan int)
-	out2 := make(chan int)
-	go func() {
-		defer close(out1)
-		defer close(out2)
-		for v := range input {
-			out1 <- v
-			out2 <- v
-		}
-	}()
-	return out1, out2
-}
-```
-
-### Ответ 12
-
-**Bridge-канал** — разворачивает `chan chan T` в `chan T`.
-
-### Ответ 13
-
-**Tee** дублирует **каждое** сообщение в **оба** канала.
-
-**Fan-out** распределяет сообщения **между** воркерами.
-
-### Ответ 14
-
-**Bridge** разворачивает `chan chan T` (канал каналов) в `chan T`.
-
-**Merge** сливает **N каналов** в один.
-
-### Ответ 15
-
-**Worker pool** — для однотипной обработки, одна стадия.
-
-**Pipeline** — для разных стадий, разное N.
-
-### Ответ 16
-
-**Баг с `i--`:** при `!ok` (канал закрыт) `<-ch1` возвращает `0, false` **немедленно**. Цикл крутится, `i--` компенсирует, но если все каналы закрыты — **бесконечный цикл**.
-
-**Исправление:** считать `received`, отключать закрытые каналы через `ch = nil`.
-
-### Ответ 17
-
-**`ch = nil` отключает case в select**, потому что приём из nil-канала **блокируется навсегда**. `select` игнорирует case с nil-каналом — он никогда не готов.
-
-### Ответ 18
-
-**Метрики pipeline:**
-- **Count** на каждой стадии.
-- **Duration** на каждой стадии.
-- **`atomic.Int64`** для счётчиков.
-- **Bottleneck** видно по метрикам.
+**С `context`:** generator видит `ctx.Done()` и завершается. `defer close(out)` закрывает канал.
 
 ---
 
-## 8.15 Куда идти дальше?
+## 8.12 Куда идти дальше?
 
-Мы разобрали pipeline: fan-out, fan-in, стадии, backpressure, отмена, tee, bridge. Теперь мы умеем строить конвейеры данных.
+Мы разобрали generator — источник данных. Теперь мы умеем читать данные из любого источника через канал.
 
-Но остаётся **практический вопрос**: как ограничить **скорость** обработки? Что если внешний сервис имеет rate limit? Что если нужно защититься от каскадных отказов?
+Но что если нужно **ждать несколько источников** одновременно? Как слить результаты из нескольких generator'ов в один?
 
-- **Как ограничить скорость?** Rate limiter, token bucket, leaky bucket. → **Глава 9: Продвинутые паттерны — semaphore, rate limiter, circuit breaker.**
-- **Как обрабатывать ошибки в конкурентном коде?** `errgroup`, `multierror`, отмена при первой ошибке. → **Глава 10: Обработка ошибок в конкурентном коде.**
-- **Как корректно завершить сервис?** Сигналы ОС, `context`, ожидание завершения. → **Глава 11: Graceful shutdown.**
+- **Как слить каналы?** → **Глава 9: Fan-in — слияние каналов.**
+- **Как распределить работу?** → **Глава 10: Fan-out — распределение работы.**
+- **Как построить конвейер?** → **Глава 11: Pipeline.**
 
 ---
 
-## 8.16 Чек-лист
+## 8.13 Чек-лист
 
 | Компонент | Что это | Ключевые факты |
 |:---|:---|:---|
-| **Fan-out A** | N каналов результатов | N воркеров + N читателей. 2N + 1 горутин |
-| **Fan-out B** | Один общий канал | N воркеров + 1 close. N + 2 горутин |
-| **Fan-in** | Слияние N каналов | N горутин + 1 для close |
-| **Fan-out + fan-in** | Классическая комбинация | 2N + 3 горутин |
-| **`i--` при `!ok`** | Баг: busy loop | Используй `received` + `ch = nil` |
-| **`ch = nil`** | Отключение case | Приём из nil блокируется навсегда |
-| **Pipeline** | Цепочка стадий | Каждая — `func(ctx, input) chan T` |
-| **Backpressure** | Замедление производителя | Размер буфера определяет скорость |
-| **Маленький буфер** | 1-10 | Быстрый backpressure |
-| **Большой буфер** | 1000+ | Отложенный backpressure |
-| **`select` с `default`** | Drop | Для некритичных данных |
-| **Закрытие** | Кто пишет — тот закрывает | Каскадное |
-| **Отмена** | `context` + `select` с `ctx.Done()` | Broadcast |
-| **`errgroup`** | Обработка ошибок | Отменяет при первой ошибке |
-| **Tee-канал** | Дублирование | В 2 канала |
-| **Bridge-канал** | Разворачивание | `chan chan T` → `chan T` |
-| **Worker pool vs pipeline** | Однотипное vs разное | Pool для однотипной, pipeline для разных стадий |
-| **Гибрид** | Pipeline из worker pool'ов | Разное N на стадиях |
-| **Метрики** | Count + duration | `atomic.Int64` |
+| **Generator** | Источник данных | `func() <-chan T` |
+| **Горутина внутри** | Чтение данных | `go func() { ... }()` |
+| **`defer close(out)`** | Закрытие канала | Сразу после `make(chan)` |
+| **`<-chan T`** | Receive-only | Потребитель не может писать |
+| **`context`** | Отмена | `select` с `ctx.Done()` |
+| **`Result{Value, Err}`** | Передача ошибок | Или отдельный канал |
+| **Backpressure** | Автоматически | Небуферизованный канал |
+| **Буфер 10–100** | Небольшой запас | Сгладить пики |
+| **Fan-out** | N воркеров | Читают из одного канала |
+| **Fan-in** | Слияние | `merge` каналов |
+| **Pipeline** | Первая стадия | Generator → стадии → потребитель |
 
-🔀 **Ключевая идея:** Fan-out — распределение работы от одного источника к N обработчикам. **Две реализации:** A (N каналов, гибко) и B (один общий, просто). Fan-in — слияние N каналов в один; N горутин + 1 для close. Fan-out + fan-in — классическая комбинация (2N + 3 горутин). Pipeline — цепочка стадий; каждая — `func(ctx, input) chan T`. Backpressure — медленная стадия замедляет быструю; размер буфера определяет скорость. Закрытие: кто пишет — тот закрывает; каскадное. Отмена через `context` + `select` с `ctx.Done()`. Tee дублирует, bridge разворачивает. Worker pool для однотипной обработки, pipeline для разных стадий. **Не используй `i--` при `!ok`** — это busy loop. Используй `received` + `ch = nil`.
+🌱 **Ключевая идея:** Generator — функция, возвращающая `<-chan T`. Запускает горутину, пишет в канал, закрывает по завершении. `context` — для отмены; без него утечка при выходе потребителя. Ошибки передаются через `Result{Value, Err}` или отдельный канал. Backpressure работает автоматически через небуферизованный канал. Generator — первая стадия pipeline; комбинируется с fan-out, fan-in, pipeline. Не забывай `defer close(out)` и `select` с `ctx.Done()`.

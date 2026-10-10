@@ -1,1097 +1,694 @@
-# 🧩 Глава 16: Sharded locks и lock-free структуры
+# 🔁 Глава 16: Retry — повторные попытки
 
 **Что вы узнаете:**
-- Почему один мьютекс на структуру — **bottleneck**.
-- Что такое **sharded locks** и как они уменьшают contention.
-- Как устроена **sharded map** и когда она быстрее `sync.Map`.
-- Что такое **lock-free** структуры и почему они сложнее mutex.
-- Как работает **Treiber stack** — lock-free стек.
-- Что такое **Michael-Scott queue** — lock-free очередь.
-- Что такое **ABA problem** и как с ним бороться.
-- Что такое **hazard pointers** и зачем они нужны.
-- Когда **lock-free хуже** обычного `Mutex`.
+- Что такое retry и какую задачу он решает.
+- Чем retry отличается от circuit breaker.
+- Как построить простейший retry.
+- Как добавить задержку между попытками.
+- Что такое экспоненциальный backoff и jitter.
+- Как ограничить общее время retry через `context`.
+- Как обрабатывать **permanent** ошибки (не повторять).
+- Как комбинировать retry с circuit breaker, rate limiter, worker pool.
 
 **После прочтения вы сможете:**
-- Построить sharded map с N шардами.
-- Понимать, когда sharding оправдан, а когда — нет.
-- Реализовать Treiber stack и Michael-Scott queue.
-- Распознавать ABA problem и знать, как её избежать.
-- Осознанно выбирать между `Mutex`, sharding и lock-free.
-- Бенчмаркать конкурентные структуры данных.
+- Построить retry с нуля.
+- Настраивать backoff и jitter.
+- Понимать, когда retry помогает, а когда — нет.
+- Ограничивать retry через `context`.
+- Отличать временные ошибки от постоянных.
+- Комбинировать retry с другими паттернами.
 
 ---
 
 ## Содержание
 
-- [16.0 Пролог: map, которая упирается в один мьютекс](#160-пролог-map-которая-упирается-в-один-мьютекс)
-- [16.1 Проблема: contention на одном мьютексе](#161-проблема-contention-на-одном-мьютексе)
-- [16.2 Sharded locks: идея и реализация](#162-sharded-locks-идея-и-реализация)
-- [16.3 Sharded map: полная реализация](#163-sharded-map-полная-реализация)
-- [16.4 Когда sharding оправдан](#164-когда-sharding-оправдан)
-- [16.5 Lock-free структуры: идея](#165-lock-free-структуры-идея)
-- [16.6 Treiber stack: lock-free стек](#166-treiber-stack-lock-free-стек)
-- [16.7 Michael-Scott queue: lock-free очередь](#167-michael-scott-queue-lock-free-очередь)
-- [16.8 ABA problem](#168-aba-problem)
-- [16.9 Hazard pointers](#169-hazard-pointers)
-- [16.10 Когда lock-free хуже Mutex](#1610-когда-lock-free-хуже-mutex)
-- [16.11 Практика Go: бенчмарки конкурентных структур](#1611-практика-go-бенчмарки-конкурентных-структур)
-- [16.12 Выводы и типичные ошибки](#1612-выводы-и-типичные-ошибки)
-- [16.13 Для быстрого повторения](#1613-для-быстрого-повторения)
-- [16.14 Вопросы для самопроверки](#1614-вопросы-для-самопроверки)
-- [16.15 Ответы](#1615-ответы)
-- [16.16 Куда идти дальше?](#1616-куда-идти-дальше)
-- [16.17 Чек-лист](#1617-чек-лист)
+- [16.0 Пролог: временные ошибки](#160-пролог-временные-ошибки)
+- [16.1 Что такое retry](#161-что-такое-retry)
+- [16.2 Простейший retry](#162-простейший-retry)
+- [16.3 Retry с задержкой и backoff](#163-retry-с-задержкой-и-backoff)
+- [16.4 Jitter: почему нужен](#164-jitter-почему-нужен)
+- [16.5 Retry с context](#165-retry-с-context)
+- [16.6 Permanent ошибки: когда не повторять](#166-permanent-ошибки-когда-не-повторять)
+- [16.7 В связке с другими паттернами](#167-в-связке-с-другими-паттернами)
+- [16.8 Практика Go: retry с метриками](#168-практика-go-retry-с-метриками)
+- [16.9 Выводы и типичные ошибки](#169-выводы-и-типичные-ошибки)
+- [16.10 Для быстрого повторения](#1610-для-быстрого-повторения)
+- [16.11 Вопросы для самопроверки](#1611-вопросы-для-самопроверки)
+- [16.12 Ответы](#1612-ответы)
+- [16.13 Куда идти дальше?](#1613-куда-идти-дальше)
+- [16.14 Чек-лист](#1614-чек-лист)
 
 ---
 
-## 16.0 Пролог: map, которая упирается в один мьютекс
+## 16.0 Пролог: временные ошибки
 
-Ты пишешь кэш на 10 миллионов ключей. 100 горутин читают и пишут одновременно.
-
-```go
-type Cache struct {
-    mu sync.RWMutex
-    m  map[string]Value
-}
-
-func (c *Cache) Get(key string) (Value, bool) {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
-    v, ok := c.m[key]
-    return v, ok
-}
-
-func (c *Cache) Set(key string, v Value) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.m[key] = v
-}
-```
-
-Профилирование показывает: **80% времени в `Mutex.Lock/Unlock`**. Contention убивает производительность.
-
-❓ **Что произошло?** Все 100 горутин конкурируют за **один** мьютекс. Даже если они работают с **разными** ключами, мьютекс сериализует их.
-
-💡 **Решение:** **sharded locks**. Разбить map на N частей, каждая со своим мьютексом. Горутины, работающие с разными частями, **не конкурируют**.
+У нас есть сервис, который ходит за обогащением в другой сервис. Работает так: клиент приходит к нам, мы делаем HTTP-запрос к сервису-обогатителю, получаем данные, отдаём клиенту.
 
 ```go
-type ShardedCache struct {
-    shards [256]struct {
-        mu sync.RWMutex
-        m  map[string]Value
+func handler(w http.ResponseWriter, r *http.Request) {
+    user, err := fetchFromExternal(r.Context())
+    if err != nil {
+        http.Error(w, err.Error(), 500)
+        return
     }
-}
-
-func (c *ShardedCache) shard(key string) *shard {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return &c.shards[h.Sum32()%256]
+    json.NewEncoder(w).Encode(user)
 }
 ```
 
-**Что изменилось:** contention упал в **256 раз** (по числу шардов).
+Работает. Но иногда внешний сервис возвращает **ошибки**. Не 100% — а, скажем, 2% запросов. По логам видно, что это **временные** ошибки: сервис перегружен, БД на секунду лагнула, сеть дрогнула. Через секунду тот же запрос проходит **успешно**.
 
-**Это sharded locks.** В этой главе — как их строить, когда применять и чем они отличаются от lock-free.
+Клиенты жалуются: 2% запросов падают. Хочется **не отдавать** клиенту ошибку, если она **временная**.
 
-> **Важный мост:** sharding — **простейший** способ уменьшить contention. Lock-free — сложнее, но даёт больше. Глава 18 (GC) — почему lock-free может быть дороже. Глава 21 (Безопасность) — почему lock-free опасен.
+Простейшая мысль: **повторить** запрос при ошибке.
+
+```go
+func fetchWithRetry(ctx context.Context, url string) (*User, error) {
+    for i := 0; i < 3; i++ {
+        user, err := fetch(url)
+        if err == nil {
+            return user, nil
+        }
+        time.Sleep(100 * time.Millisecond)  // ← фиксированная задержка
+    }
+    return nil, errors.New("max retries")
+}
+```
+
+Работает. Но если внешний сервис **сильно** перегружен — 3 попытки **подряд** только **ухудшают** ситуацию. Мы **добавляем** ему нагрузку.
+
+Хочется: **повторять**, но с **умной** задержкой, и **не повторять** постоянные ошибки (401, 404). И **не бесконечно** — общий таймаут.
+
+Это и есть **retry** — паттерн повторных попыток.
+
+> **Мост к следующим главам:** retry часто используется вместе с circuit breaker (Глава 15) и rate limiter (Глава 14). Понимание retry даёт понимание, **как не ухудшить ситуацию при повторных попытках**.
 
 ---
 
-## 16.1 Проблема: contention на одном мьютексе
+## 16.1 Что такое retry
 
-Прежде чем разбирать sharding, поймём **проблему**.
+**Retry** — паттерн, при котором неудачные операции **повторяются** несколько раз.
 
-### Что такое contention
+### Идея
 
-**Contention** (конкуренция) — ситуация, когда несколько горутин конкурируют за **один** ресурс (мьютекс, кэш-линию, CPU).
+**Временные ошибки** — нормальны для распределённых систем. Сеть дрогнула, сервис перегружен, БД лагнула. Через секунду та же операция пройдёт.
 
-**В Главе 3** мы разбирали contention на `Mutex`: горутины уходят в slow path, spin, `semaRoot`.
+**Retry** повторяет операцию, давая системе **время** восстановиться.
 
-**Формула:**
+### Retry vs circuit breaker
 
-```
-Время ожидания ≈ O(N × T_hold)
+| Аспект | Retry | Circuit breaker |
+|:---|:---|:---|
+| Что делает | Повторяет | Прекращает |
+| Когда | Временные ошибки | Постоянные сбои |
+| Риск | Ухудшить ситуацию | Никогда не восстановиться |
+| Как часто | 1–5 попыток | Открывается при N ошибках |
 
-где N — число горутин, конкурирующих за мьютекс,
-    T_hold — среднее время удержания мьютекса.
-```
+**Вместе:** retry повторяет, circuit breaker прекращает, если retry не помогает.
 
-**Пример:** 100 горутин, каждая держит мьютекс 1 мкс. Последняя ждёт 99 мкс.
+### Когда использовать retry
 
-### Contention на map
+**1. Временные ошибки.**
 
-**Проблема:** один `RWMutex` на всю map.
+- HTTP 5xx (кроме 501 Not Implemented).
+- Сетевые ошибки (timeout, connection refused).
+- БД: deadlock, serialization failure.
+- Rate limit 429 (Too Many Requests).
+
+**2. Идемпотентные операции.**
+
+- GET запросы.
+- PUT запросы.
+- DELETE запросы.
+
+**3. Внешние сервисы.**
+
+- Микросервисы.
+- БД.
+- Кэши.
+
+### Когда НЕ использовать retry
+
+**1. Постоянные ошибки.**
+
+- 400 Bad Request.
+- 401 Unauthorized.
+- 403 Forbidden.
+- 404 Not Found.
+- 501 Not Implemented.
+
+**Retry не поможет.** Эти ошибки повторятся.
+
+**2. Не-идемпотентные операции.**
+
+- POST без idempotency key.
+- Платежи без idempotency key.
+
+**Риск:** задвоение платежа.
+
+**3. Высокая нагрузка.**
+
+Если сервис **перегружен**, retry **ухудшает** ситуацию. Нужен circuit breaker.
+
+### Правила retry
+
+**1. Ограниченное число попыток.**
+
+- 3–5 попыток — разумно.
+- 10+ — опасно.
+
+**2. Задержка между попытками.**
+
+- Без задержки — DDOS на сервис.
+- С задержкой — время восстановиться.
+
+**3. Экспоненциальный backoff.**
+
+- 100 мс, 200 мс, 400 мс, 800 мс...
+- Экспоненциальный рост.
+
+**4. Jitter.**
+
+- Случайный разброс.
+- Предотвращает «толпу».
+
+**5. Общий таймаут.**
+
+- Не более N секунд всего.
+- Через `context`.
+
+### 💡 Практика: как думать о retry
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Retry — для временных ошибок.**
+2. **3–5 попыток максимум.**
+3. **Задержка + jitter.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Экспоненциальный backoff.**
+5. **`context` с общим таймаутом.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не retry permanent ошибки.**
+7. **Не retry без задержки.**
+8. **Не retry не-идемпотентные операции без ключа.**
+
+---
+
+## 16.2 Простейший retry
+
+Начнём с самого простого — N попыток без задержки.
+
+### Реализация
 
 ```go
-type Cache struct {
-    mu sync.RWMutex
-    m  map[string]Value
+func retry(n int, fn func() error) error {
+    var lastErr error
+    for i := 0; i < n; i++ {
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+    }
+    return lastErr
+}
+```
+
+**Что делает:** вызывает `fn` до N раз. Возвращает последнюю ошибку.
+
+### Потребитель
+
+```go
+func main() {
+    attempts := 0
+    
+    err := retry(3, func() error {
+        attempts++
+        if attempts < 3 {
+            return errors.New("temporary error")
+        }
+        return nil
+    })
+    
+    fmt.Println("attempts:", attempts)
+    fmt.Println("error:", err)
+}
+```
+
+**Пример вывода:**
+
+```
+attempts: 3
+error: <nil>
+```
+
+**Что видно:** третья попытка успешна.
+
+### Проблема: нет задержки
+
+**Что если ошибка из-за перегрузки?** Три попытки **мгновенно** только **ухудшают** ситуацию. Внешний сервис получает **3 запроса** за миллисекунду.
+
+### Проблема: нет ограничения по времени
+
+**Что если каждая попытка занимает 5 секунд?** 3 попытки = 15 секунд. Клиент всё это время ждёт.
+
+### Проблема: нет различения ошибок
+
+**Что если ошибка — 404?** Retry не поможет. Все 3 попытки вернут 404.
+
+### Проблема: нет метрик
+
+**Что если мы не видим, сколько retry делается?** Не знаем, помогает ли retry.
+
+### Схема
+
+```
+retry(3, fn):
+
+  attempt 1 ──► err ──► attempt 2 ──► err ──► attempt 3 ──► err
+                                                          │
+                                                          ▼
+                                                       return err
+```
+
+### 💡 Практика: как писать простой retry
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **N попыток — 3–5.**
+2. **Возвращай последнюю ошибку.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Добавь задержку** (см. 16.3).
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не retry без задержки в production.**
+5. **Не retry бесконечно.**
+
+---
+
+## 16.3 Retry с задержкой и backoff
+
+Добавим **задержку** между попытками.
+
+### Фиксированная задержка
+
+```go
+func retryWithDelay(n int, delay time.Duration, fn func() error) error {
+    var lastErr error
+    for i := 0; i < n; i++ {
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        if i < n-1 {
+            time.Sleep(delay)
+        }
+    }
+    return lastErr
+}
+```
+
+**Что делает:** между попытками спит `delay`.
+
+**Проблема:** фиксированная задержка **не адаптируется**. Если сервис восстанавливается за 1 секунду — 100 мс недостаточно. Если за 100 мс — 1 секунда избыточна.
+
+### Экспоненциальный backoff
+
+**Идея:** задержка **удваивается** с каждой попыткой.
+
+```
+attempt 1: 100 мс
+attempt 2: 200 мс
+attempt 3: 400 мс
+attempt 4: 800 мс
+attempt 5: 1600 мс
+```
+
+**Зачем:**
+
+- Первая попытка — быстро.
+- Если ошибка временная — следующая попытка через 100 мс.
+- Если ошибка долгая — следующая попытка через 1.6 сек.
+
+### Реализация
+
+```go
+func retryWithBackoff(n int, baseDelay time.Duration, fn func() error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        
+        if i < n-1 {
+            time.Sleep(delay)
+            delay *= 2  // удваиваем
+        }
+    }
+    return lastErr
+}
+```
+
+### Пример
+
+```go
+func main() {
+    attempts := 0
+    start := time.Now()
+    
+    err := retryWithBackoff(4, 100*time.Millisecond, func() error {
+        attempts++
+        fmt.Printf("[%v] attempt %d\n", time.Since(start).Round(time.Millisecond), attempts)
+        return errors.New("temporary error")
+    })
+    
+    fmt.Println("error:", err)
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] attempt 1
+[100ms] attempt 2
+[300ms] attempt 3
+[700ms] attempt 4
+error: temporary error
+```
+
+**Что видно:**
+
+- Attempt 1 — сразу.
+- Attempt 2 — через 100 мс.
+- Attempt 3 — через 200 мс (100+100).
+- Attempt 4 — через 400 мс (100+200+400).
+
+### Ограничение максимальной задержки
+
+**Проблема:** экспоненциальный backoff может стать **очень большим**.
+
+```
+attempt 10: 51.2 сек
+attempt 20: 14 часов
+```
+
+**Решение:** **cap** — максимальная задержка.
+
+```go
+func retryWithBackoff(n int, baseDelay, maxDelay time.Duration, fn func() error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        
+        if i < n-1 {
+            time.Sleep(delay)
+            delay *= 2
+            if delay > maxDelay {
+                delay = maxDelay
+            }
+        }
+    }
+    return lastErr
+}
+```
+
+**Пример с maxDelay = 1 сек:**
+
+```
+attempt 1: 0s
+attempt 2: 100ms
+attempt 3: 300ms
+attempt 4: 700ms
+attempt 5: 1500ms (не 1500, а 1000 + 700 = 1700... cap на 1000)
+```
+
+### Схема
+
+```
+Экспоненциальный backoff:
+
+  attempt 1: 0 ms
+  attempt 2: 100 ms
+  attempt 3: 300 ms (100 + 200)
+  attempt 4: 700 ms (100 + 200 + 400)
+  attempt 5: 1500 ms (100 + 200 + 400 + 800)
+  
+  С maxDelay = 500 ms:
+  attempt 1: 0 ms
+  attempt 2: 100 ms
+  attempt 3: 300 ms
+  attempt 4: 800 ms (300 + 500 вместо 700)
+  attempt 5: 1300 ms (800 + 500)
+```
+
+### 💡 Практика: как настроить backoff
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Экспоненциальный backoff** — стандарт.
+2. **Base delay 50–200 мс.**
+3. **Max delay 1–5 сек.**
+4. **N попыток 3–5.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+5. **Jitter** (см. 16.4).
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не используй фиксированную задержку.**
+7. **Не давай backoff расти бесконечно.**
+
+---
+
+## 16.4 Jitter: почему нужен
+
+**Jitter** — случайный разброс задержки. Предотвращает **thundering herd**.
+
+### Проблема: thundering herd
+
+Представь: 1000 клиентов одновременно получили ошибку. Все начали retry **одновременно**:
+
+```
+t=0:    1000 клиентов получили ошибку
+t=100ms: все 1000 делают попытку 2
+t=300ms: все 1000 делают попытку 3
+...
+```
+
+**Что происходит:** на сервис идёт **1000 одновременных** запросов. Он **снова** перегружается.
+
+### Решение: jitter
+
+Добавляем **случайный разброс** к задержке:
+
+```
+t=0:    1000 клиентов получили ошибку
+t=100ms: клиент 1 делает попытку 2
+t=110ms: клиент 2 делает попытку 2
+t=120ms: клиент 3 делает попытку 2
+...
+```
+
+**Что происходит:** запросы **распределяются** во времени. Сервис получает **плавную** нагрузку.
+
+### Реализация
+
+**Full jitter:**
+
+```go
+delay := time.Duration(rand.Int63n(int64(maxDelay)))
+```
+
+**Что делает:** случайная задержка от 0 до maxDelay.
+
+**Equal jitter:**
+
+```go
+half := delay / 2
+delay = half + time.Duration(rand.Int63n(int64(half)))
+```
+
+**Что делает:** задержка от delay/2 до delay.
+
+**Decorrelated jitter:**
+
+```go
+delay = min(maxDelay, baseDelay + time.Duration(rand.Int63n(int64(delay*3-baseDelay))))
+```
+
+**Что делает:** задержка зависит от предыдущей.
+
+### Простая реализация
+
+```go
+func retryWithBackoffJitter(n int, baseDelay, maxDelay time.Duration, fn func() error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        
+        if i < n-1 {
+            // Jitter: delay ± 50%
+            jitter := time.Duration(rand.Int63n(int64(delay))) - delay/2
+            time.Sleep(delay + jitter)
+            
+            delay *= 2
+            if delay > maxDelay {
+                delay = maxDelay
+            }
+        }
+    }
+    return lastErr
+}
+```
+
+**Что делает:** задержка `delay ± 50%`.
+
+### Пример
+
+```go
+func main() {
+    attempts := 0
+    start := time.Now()
+    
+    err := retryWithBackoffJitter(4, 100*time.Millisecond, 1*time.Second, func() error {
+        attempts++
+        fmt.Printf("[%v] attempt %d\n", time.Since(start).Round(time.Millisecond), attempts)
+        return errors.New("temporary error")
+    })
+    
+    fmt.Println("error:", err)
+}
+```
+
+**Пример вывода:**
+
+```
+[0s] attempt 1
+[85ms] attempt 2
+[251ms] attempt 3
+[623ms] attempt 4
+error: temporary error
+```
+
+**Что видно:** задержки разные (85, 166, 372). Это jitter.
+
+### Схема
+
+```
+Без jitter:
+  1000 клиентов:
+    t=100ms: ████████████████████
+    t=300ms: ████████████████████
+    t=700ms: ████████████████████
+
+С jitter:
+  1000 клиентов:
+    t=100-200ms: ████████████████████
+    t=200-500ms: ████████████████████
+    t=500-1200ms: ████████████████████
+```
+
+### 💡 Практика: как использовать jitter
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Jitter для всех retry.**
+2. **Full jitter** (`rand.Int63n(delay)`) — просто.
+3. **Equal jitter** (`delay/2 + rand.Int63n(delay/2)`) — стандарт.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **`math/rand/v2`** в Go 1.22+.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не retry без jitter при многих клиентах.**
+
+---
+
+## 16.5 Retry с context
+
+`context` — критичен для retry. Без него retry может **блокироваться навсегда**.
+
+### Проблема
+
+```go
+for i := 0; i < n; i++ {
+    err := fn()
+    if err == nil {
+        return nil
+    }
+    time.Sleep(delay)  // ← если ctx отменён — всё равно спим
+}
+```
+
+**Что происходит:** если `ctx` отменён во время `time.Sleep`, retry **продолжит** работу.
+
+### Решение: select с ctx.Done()
+
+```go
+func retryCtx(ctx context.Context, n int, baseDelay time.Duration, fn func(ctx context.Context) error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        select {
+        case <-ctx.Done():
+            if lastErr != nil {
+                return lastErr  // возвращаем последнюю ошибку
+            }
+            return ctx.Err()
+        default:
+        }
+        
+        err := fn(ctx)
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        
+        if i < n-1 {
+            select {
+            case <-ctx.Done():
+                return lastErr
+            case <-time.After(delay):
+            }
+            delay *= 2
+        }
+    }
+    return lastErr
 }
 ```
 
 **Что происходит:**
 
-- 100 горутин читают и пишут.
-- `RWMutex` позволяет читателям **параллельно**, но писатель **блокирует всех**.
-- Если писателей много — contention растёт.
-- Если читателей много, но писатель частый — тоже.
-
-### Как измерить contention
-
-**Mutex profile:**
-
-```go
-runtime.SetMutexProfileFraction(1)
-```
-
-```bash
-go tool pprof mutex.prof
-```
-
-**Что искать:**
-
-- `sync.(*Mutex).Lock` в top.
-- `sync.(*RWMutex).Lock` в top.
-
-**Block profile:**
-
-```go
-runtime.SetBlockProfileRate(1)
-```
-
-```bash
-go tool pprof block.prof
-```
-
-**Что искать:**
-
-- Время, проведённое в ожидании.
-
-### Как уменьшить contention
-
-**1. Sharding.**
-
-Разбить структуру на N частей, каждая со своим мьютексом.
-
-**2. Lock-free.**
-
-Использовать `atomic` вместо `Mutex`.
-
-**3. Разделение мьютексов.**
-
-Отдельные мьютексы для разных данных.
-
-**4. Read-only копии.**
-
-Использовать `atomic.Pointer` для снапшотов.
-
-### Аннотация сложности
-
-| Подход | Contention |
-|:---|:---|
-| Один `Mutex` | O(N) |
-| `RWMutex` | O(писателей × N) |
-| Sharding на 256 | O(N/256) |
-| Lock-free | 0 (но CAS contention) |
-
-### 💡 Практика: как обнаружить contention
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Mutex profile** — `SetMutexProfileFraction(1)`.
-2. **Block profile** — `SetBlockProfileRate(1)`.
-3. **pprof** — `go tool pprof`.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Метрики** — latency операций.
-5. **Бенчмарки** с разными `GOMAXPROCS`.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не оптимизируй преждевременно.** Contention виден в профиле.
-7. **Не игнорируй высокий contention.**
-
-### Ключевые выводы подглавы 16.1
-
-- **Contention** — конкуренция за один ресурс.
-- **Формула:** O(N × T_hold).
-- **Один мьютекс на map** — bottleneck.
-- **Mutex profile** — для обнаружения.
-- **Sharding** — простейшее решение.
-
----
-
-## 16.2 Sharded locks: идея и реализация
-
-**Sharded locks** — разбиение структуры на N частей, каждая со своим мьютексом.
-
-### Идея
-
-```
-Без sharding:
-  ┌─────────────────────────────────────────────┐
-  │              Один RWMutex                    │
-  │  ┌─────────────────────────────────────┐    │
-  │  │  map (все ключи)                     │    │
-  │  └─────────────────────────────────────┘    │
-  └─────────────────────────────────────────────┘
-  Все горутины конкурируют за один мьютекс.
-
-С sharding (N=4):
-  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-  │  RWMutex 0   │  │  RWMutex 1   │  │  RWMutex 2   │  │  RWMutex 3   │
-  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │
-  │  │ map 0  │  │  │  │ map 1  │  │  │  │ map 2  │  │  │  │ map 3  │  │
-  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │
-  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
-  Горутины, работающие с разными шардами, не конкурируют.
-```
-
-### Как выбрать шард
-
-**Хэш-функция** определяет, в какой шард попадёт ключ.
-
-```go
-func (c *ShardedCache) shard(key string) int {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return int(h.Sum32() % uint32(len(c.shards)))
-}
-```
-
-**Что важно:**
-
-- **Равномерное распределение.** Ключи должны попадать в шарды равномерно.
-- **Быстрый хэш.** `fnv`, `xxhash`, `maphash`.
-- **Стабильность.** Один и тот же ключ → один и тот же шард.
-
-### Хэш-функции в Go
-
-**1. `hash/fnv`** — простой, быстрый.
-
-```go
-import "hash/fnv"
-
-h := fnv.New32a()
-h.Write([]byte(key))
-sum := h.Sum32()
-```
-
-**2. `hash/maphash`** — стандартный, быстрый.
-
-```go
-import "hash/maphash"
-
-var seed = maphash.MakeSeed()
-
-func hash(key string) uint64 {
-    return maphash.String(seed, key)
-}
-```
-
-**3. `xxhash`** — очень быстрый, но внешний.
-
-```go
-import "github.com/cespare/xxhash/v2"
-
-sum := xxhash.Sum64String(key)
-```
-
-**4. `fnv` vs `maphash`:**
-
-- `fnv` — детерминированный, простой.
-- `maphash` — использует случайный seed (защита от hash DoS).
-
-### Реализация простого sharded cache
-
-```go
-type ShardedCache struct {
-    shards []*shard
-}
-
-type shard struct {
-    mu sync.RWMutex
-    m  map[string]Value
-}
-
-func NewShardedCache(numShards int) *ShardedCache {
-    c := &ShardedCache{
-        shards: make([]*shard, numShards),
-    }
-    for i := range c.shards {
-        c.shards[i] = &shard{
-            m: make(map[string]Value),
-        }
-    }
-    return c
-}
-
-func (c *ShardedCache) shardFor(key string) *shard {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return c.shards[h.Sum32()%uint32(len(c.shards))]
-}
-
-func (c *ShardedCache) Get(key string) (Value, bool) {
-    s := c.shardFor(key)
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    v, ok := s.m[key]
-    return v, ok
-}
-
-func (c *ShardedCache) Set(key string, v Value) {
-    s := c.shardFor(key)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.m[key] = v
-}
-
-func (c *ShardedCache) Delete(key string) {
-    s := c.shardFor(key)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    delete(s.m, key)
-}
-```
-
-**Что делает:**
-
-1. Создаёт N шардов, каждый со своим `RWMutex` и map.
-2. `shardFor(key)` — определяет шард по ключу.
-3. Операции работают с **одним** шардом.
-
-### Сколько шардов
-
-**Правило:** **N = 2^k**, где k — степень двойки, близкая к числу CPU.
-
-**Примеры:**
-
-- 8 ядер → 16 шардов.
-- 16 ядер → 32 шарда.
-- 64 ядра → 128 шардов.
-
-**Почему степень двойки:**
-
-- `h.Sum32() % N` — быстро для N = 2^k.
-- Можно заменить на `h & (N - 1)`.
-
-**Слишком много шардов:**
-
-- Больше памяти.
-- Больше кэш-промахов.
-
-**Слишком мало:**
-
-- Contention.
-
-### Оптимизация: shardFor через маску
-
-```go
-func (c *ShardedCache) shardFor(key string) *shard {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return c.shards[h.Sum32()&uint32(len(c.shards)-1)]
-}
-```
-
-**Что изменилось:** `% N` → `& (N-1)`. Работает для N = 2^k.
-
-### Аннотация сложности
-
-| Операция | Time (N=256) |
-|:---|:---|
-| `shardFor` | ~20-50 нс |
-| `Get` | ~50-100 нс |
-| `Set` | ~50-100 нс |
-
-### 💡 Практика: как строить sharded locks
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **N = 2^k**, где k — степень двойки.
-2. **N ≈ 2 × число ядер.**
-3. **Быстрый хэш** — `fnv`, `maphash`.
-4. **Равномерное распределение.**
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-5. **`& (N-1)`** вместо `% N` для N = 2^k.
-6. **Бенчмаркай** разные N.
-
-**❌ НЕ ДЕЛАЙ:**
-
-7. **Не используй sharding для малых структур.** Overhead.
-8. **Не забывай про качество хэша.**
-
-### Ключевые выводы подглавы 16.2
-
-- **Sharding** — разбиение на N частей.
-- **Хэш-функция** определяет шард.
-- **N = 2^k**, близко к числу ядер.
-- **`& (N-1)`** вместо `% N`.
-- **Быстрый хэш** — `fnv`, `maphash`.
-
----
-
-## 16.3 Sharded map: полная реализация
-
-Соберём **полную sharded map**.
-
-### Полный код
-
-```go
-package sharded
-
-import (
-    "hash/fnv"
-    "sync"
-)
-
-type Map[K comparable, V any] struct {
-    shards []*shard[K, V]
-    mask   uint32
-}
-
-type shard[K comparable, V any] struct {
-    mu sync.RWMutex
-    m  map[K]V
-}
-
-func New[K comparable, V any](numShards int) *Map[K, V] {
-    if numShards <= 0 {
-        numShards = 1
-    }
-    // Округляем до степени двойки
-    n := 1
-    for n < numShards {
-        n <<= 1
-    }
-
-    m := &Map[K, V]{
-        shards: make([]*shard[K, V], n),
-        mask:   uint32(n - 1),
-    }
-    for i := range m.shards {
-        m.shards[i] = &shard[K, V]{
-            m: make(map[K]V),
-        }
-    }
-    return m
-}
-
-func (m *Map[K, V]) shardFor(key K) *shard[K, V] {
-    h := fnv.New32a()
-    // Для generic K используем fmt
-    h.Write([]byte(fmt.Sprintf("%v", key)))
-    return m.shards[h.Sum32()&m.mask]
-}
-
-func (m *Map[K, V]) Get(key K) (V, bool) {
-    s := m.shardFor(key)
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    v, ok := s.m[key]
-    return v, ok
-}
-
-func (m *Map[K, V]) Set(key K, value V) {
-    s := m.shardFor(key)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.m[key] = value
-}
-
-func (m *Map[K, V]) Delete(key K) {
-    s := m.shardFor(key)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    delete(s.m, key)
-}
-
-func (m *Map[K, V]) Len() int {
-    total := 0
-    for _, s := range m.shards {
-        s.mu.RLock()
-        total += len(s.m)
-        s.mu.RUnlock()
-    }
-    return total
-}
-
-func (m *Map[K, V]) Range(fn func(K, V) bool) {
-    for _, s := range m.shards {
-        s.mu.RLock()
-        for k, v := range s.m {
-            if !fn(k, v) {
-                s.mu.RUnlock()
-                return
-            }
-        }
-        s.mu.RUnlock()
-    }
-}
-```
-
-### Разберём по шагам
-
-#### Шаг 1: округление до степени двойки
-
-```go
-n := 1
-for n < numShards {
-    n <<= 1
-}
-```
-
-**Что делает:** находит ближайшую степень двойки ≥ `numShards`.
-
-**Пример:** `numShards = 100` → `n = 128`.
-
-#### Шаг 2: маска
-
-```go
-mask: uint32(n - 1)
-```
-
-**Что делает:** `n = 128` → `mask = 127` (0b01111111).
-
-**Использование:** `h.Sum32() & mask` эквивалентно `h.Sum32() % n`.
-
-#### Шаг 3: хэш для generic K
-
-```go
-h := fnv.New32a()
-h.Write([]byte(fmt.Sprintf("%v", key)))
-```
-
-**Проблема:** для generic `K` нельзя напрямую хэшировать.
-
-**Решение:** `fmt.Sprintf("%v", key)` — преобразует в строку.
-
-**Минус:** медленно для не-строк.
-
-**Альтернатива:** использовать интерфейс `Hasher`:
-
-```go
-type Hasher interface {
-    Hash() uint64
-}
-
-func (m *Map[K, V]) shardFor(key K) *shard[K, V] {
-    if h, ok := any(key).(Hasher); ok {
-        return m.shards[h.Hash()&uint64(m.mask)]
-    }
-    // fallback
-    ...
-}
-```
-
-#### Шаг 4: Get с RLock
-
-```go
-func (m *Map[K, V]) Get(key K) (V, bool) {
-    s := m.shardFor(key)
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    v, ok := s.m[key]
-    return v, ok
-}
-```
-
-**Что делает:** читает из одного шарда.
-
-**Почему `RLock`:** читатели параллельны.
-
-#### Шаг 5: Set с Lock
-
-```go
-func (m *Map[K, V]) Set(key K, value V) {
-    s := m.shardFor(key)
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    s.m[key] = value
-}
-```
-
-**Что делает:** пишет в один шард.
-
-**Почему `Lock`:** писатель блокирует шард.
-
-#### Шаг 6: Len
-
-```go
-func (m *Map[K, V]) Len() int {
-    total := 0
-    for _, s := range m.shards {
-        s.mu.RLock()
-        total += len(s.m)
-        s.mu.RUnlock()
-    }
-    return total
-}
-```
-
-**Что делает:** суммирует размеры всех шардов.
-
-**Важно:** не атомарно. Между шардами map может измениться.
-
-#### Шаг 7: Range
-
-```go
-func (m *Map[K, V]) Range(fn func(K, V) bool) {
-    for _, s := range m.shards {
-        s.mu.RLock()
-        for k, v := range s.m {
-            if !fn(k, v) {
-                s.mu.RUnlock()
-                return
-            }
-        }
-        s.mu.RUnlock()
-    }
-}
-```
-
-**Что делает:** проходит по всем шардам.
-
-**Важно:** блокирует **один** шард за раз. Не весь map.
-
-### Использование
-
-```go
-func main() {
-    m := New[string, int](256)
-
-    var wg sync.WaitGroup
-    for i := 0; i < 100; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                key := fmt.Sprintf("key-%d-%d", id, j)
-                m.Set(key, id*1000+j)
-            }
-        }(i)
-    }
-    wg.Wait()
-
-    fmt.Println("len:", m.Len())
-
-    count := 0
-    m.Range(func(k string, v int) bool {
-        count++
-        return true
-    })
-    fmt.Println("range:", count)
-}
-```
-
-### Сравнение с `sync.Map`
-
-| Аспект | `sync.Map` | Sharded map |
-|:---|:---|:---|
-| Read-heavy | ✅ Хорошо | ✅ Хорошо |
-| Write-heavy | ❌ Плохо | ✅ Хорошо |
-| Range | Атомарный | Не атомарный |
-| Память | ~48 байт | ~N × 100 байт |
-| Типизация | `any` | Generic |
-
-**Рекомендация:**
-
-- **Read-heavy** — `sync.Map`.
-- **Write-heavy** — sharded map.
-- **Смешанная** — бенчмаркай.
-
-### Аннотация сложности
-
-| Операция | Time (N=256) |
-|:---|:---|
-| `shardFor` | ~30-50 нс |
-| `Get` | ~50-100 нс |
-| `Set` | ~50-100 нс |
-| `Delete` | ~50-100 нс |
-| `Len` | ~N × 50 нс |
-| `Range` | ~N × 100 нс |
-
-### 💡 Практика: как строить sharded map
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Generic** — для типобезопасности.
-2. **N = 2^k** — для быстрой маски.
-3. **`& mask`** вместо `% N`.
-4. **RWMutex** в каждом шарде.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-5. **Hasher-интерфейс** для быстрого хэша.
-6. **Len/Range** — для диагностики.
-
-**❌ НЕ ДЕЛАЙ:**
-
-7. **Не используй `fmt.Sprintf`** для hot path.
-8. **Не забывай про качество хэша.**
-
-### Ключевые выводы подглавы 16.3
-
-- **Sharded map** — N шардов, каждый с `RWMutex`.
-- **Generic** — для типобезопасности.
-- **`& mask`** — быстро.
-- **Write-heavy** — sharded map. **Read-heavy** — `sync.Map`.
-
----
-
-## 16.4 Когда sharding оправдан
-
-Разберём **когда** sharding **оправдан**.
-
-### Оправдан
-
-**1. Высокий contention.**
-
-Если mutex profile показывает высокий contention — sharding поможет.
-
-**2. Write-heavy нагрузка.**
-
-`RWMutex` не помогает, если писателей много. Sharding — да.
-
-**3. Большая map.**
-
-Для 10 миллионов ключей — sharding уменьшает contention.
-
-**4. Разные ключи.**
-
-Если горутины работают с разными ключами — sharding разведёт их по шардам.
-
-**5. Долгие операции.**
-
-Если операции долгие — contention растёт. Sharding помогает.
-
-### Не оправдан
-
-**1. Низкий contention.**
-
-Если все операции быстрые и contention низкий — sharding добавит overhead.
-
-**2. Маленькая map.**
-
-Для 100 ключей — sharding не поможет.
-
-**3. Read-only нагрузка.**
-
-Если только чтение — `RWMutex` справляется. Sharding не нужен.
-
-**4. Один шард.**
-
-Если все ключи попадают в один шард (плохой хэш) — sharding бесполезен.
-
-**5. Операции над несколькими ключами.**
-
-Если операция захватывает несколько ключей — sharding сложен.
-
-### Сравнение
-
-| Сценарий | Один Mutex | Sharding | sync.Map |
-|:---|:---|:---|:---|
-| Read-only | ✅ | ✅ | ✅ |
-| Read-heavy | ✅ | ✅ | ✅ |
-| Write-heavy | ❌ | ✅ | ❌ |
-| Мало ключей | ✅ | ❌ | ✅ |
-| Много ключей | ❌ | ✅ | ⚠️ |
-
-### Как измерить
-
-**1. Mutex profile.**
-
-```go
-runtime.SetMutexProfileFraction(1)
-```
-
-**Что искать:** `Mutex.Lock` в top.
-
-**2. Бенчмарки.**
-
-```go
-func BenchmarkMap(b *testing.B) {
-    m := New[string, int](256)
-    b.RunParallel(func(pb *testing.PB) {
-        for pb.Next() {
-            m.Set("key", 1)
-            m.Get("key")
-        }
-    })
-}
-```
-
-**Что искать:** scaling с `GOMAXPROCS`.
-
-### Аннотация сложности
-
-| Сценарий | Один Mutex | Sharding |
-|:---|:---|:---|
-| 8 ядер, write-heavy | ~1000 нс | ~100 нс |
-| 8 ядер, read-only | ~50 нс | ~50 нс |
-
-### 💡 Практика: когда использовать sharding
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Mutex profile** — для обнаружения contention.
-2. **Бенчмаркай** перед sharding.
-3. **Write-heavy** — sharding.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Разные N** — для оптимизации.
-5. **Метрики** — latency.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не делай sharding без причины.**
-7. **Не забывай про качество хэша.**
-
-### Ключевые выводы подглавы 16.4
-
-- **Sharding оправдан** при высоком contention, write-heavy, большой map.
-- **Не оправдан** при низком contention, read-only, малой map.
-- **Mutex profile** — для обнаружения.
-- **Бенчмаркай** перед sharding.
-
----
-
-## 16.5 Lock-free структуры: идея
-
-**Lock-free** — структуры данных **без мьютексов**.
-
-### Идея
-
-**Обычный mutex:**
-
-```
-Горутина A: Lock → работа → Unlock
-Горутина B: ────ЖДЁТ───────Lock → работа → Unlock
-```
-
-**Lock-free:**
-
-```
-Горутина A: CAS → работа → CAS
-Горутина B: CAS → работа → CAS
-```
-
-**Ключевое:** обе горутины **не блокируются**. Используют `atomic.CompareAndSwap`.
-
-### Три уровня
-
-**1. Blocking.**
-
-- Мьютексы.
-- Горутина **блокируется**, пока другой не отпустит.
-
-**2. Lock-free.**
-
-- Хотя бы **одна** горутина делает прогресс.
-- `CAS` retry loop.
-
-**3. Wait-free.**
-
-- **Все** горутины делают прогресс за **ограниченное** число шагов.
-- Очень сложно.
-
-### CAS: Compare-And-Swap
-
-**Основа lock-free:**
-
-```go
-func CompareAndSwap(addr *T, old, new T) bool
-```
-
-**Алгоритм:**
-
-1. Прочитать `*addr`.
-2. Если `*addr == old` — записать `new`, вернуть `true`.
-3. Иначе — вернуть `false`.
-
-**Всё атомарно.**
-
-### Retry loop
-
-**Классический паттерн:**
-
-```go
-for {
-    old := atomic.Load(&value)
-    new := compute(old)
-    if atomic.CompareAndSwap(&value, old, new) {
-        return
-    }
-    // Не удалось — кто-то изменил value
-    // Повторяем
-}
-```
-
-**Что делает:**
-
-1. Читаем текущее значение.
-2. Вычисляем новое.
-3. Пытаемся заменить через CAS.
-4. Если не удалось — повторяем.
-
-### Пример: lock-free счётчик
-
-```go
-type Counter struct {
-    value atomic.Int64
-}
-
-func (c *Counter) Inc() {
-    c.value.Add(1)  // atomic.Add — lock-free
-}
-
-func (c *Counter) Get() int64 {
-    return c.value.Load()
-}
-```
-
-**Что делает:** `atomic.Add` — lock-free инкремент.
-
-### Пример: lock-free update
-
-```go
-func updateIfEqual(addr *atomic.Int64, old, new int64) bool {
-    return addr.CompareAndSwap(old, new)
-}
-```
-
-### Преимущества lock-free
-
-1. **Нет блокировок.** Горутины не ждут.
-2. **Нет deadlock.** Нет мьютексов — нет взаимных блокировок.
-3. **Нет starvation** (в теории).
-4. **Лучше для real-time систем.**
-
-### Недостатки lock-free
-
-1. **CAS contention.** При высокой конкуренции CAS «проваливается».
-2. **Сложность.** Трудно писать и отлаживать.
-3. **ABA problem.** См. 16.8.
-4. **Memory reclamation.** Когда освобождать узлы? См. 16.9.
-5. **Может быть медленнее mutex.** При высокой конкуренции.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `atomic.Load` | ~1-2 нс |
-| `atomic.Store` | ~1-2 нс |
-| `atomic.CAS` | ~5-15 нс |
-| `atomic.Add` | ~5-10 нс |
-| `Mutex.Lock/Unlock` | ~15-25 нс |
-
-### 💡 Практика: как использовать lock-free
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`atomic` для простых случаев** — счётчики, флаги, указатели.
-2. **CAS retry loop** — для сложных.
-3. **Бенчмаркай** против mutex.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Простые структуры** — stack, queue.
-5. **Hazard pointers** — для memory reclamation.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не пиши lock-free без необходимости.**
-7. **Не используй lock-free для сложных структур.**
-8. **Не игнорируй ABA problem.**
-
-### Ключевые выводы подглавы 16.5
-
-- **Lock-free** — без мьютексов.
-- **CAS** — основа.
-- **Retry loop** — классический паттерн.
-- **Плюсы:** нет блокировок, deadlock, starvation.
-- **Минусы:** сложность, ABA, memory reclamation.
-
----
-
-## 16.6 Treiber stack: lock-free стек
-
-**Treiber stack** — простейшая lock-free структура.
-
-### Идея
-
-**Стек** — LIFO. Операции: `Push`, `Pop`.
-
-**Treiber stack** использует `atomic.Pointer` на голову.
-
-### Структура
-
-```go
-type node[T any] struct {
-    value T
-    next  *node[T]
-}
-
-type Stack[T any] struct {
-    head atomic.Pointer[node[T]]
-}
-```
-
-### Push
-
-```go
-func (s *Stack[T]) Push(value T) {
-    n := &node[T]{value: value}
-    for {
-        old := s.head.Load()
-        n.next = old
-        if s.head.CompareAndSwap(old, n) {
-            return
-        }
-        // Кто-то изменил head — повторяем
-    }
-}
-```
-
-**Что делает:**
-
-1. Создаёт новый узел `n`.
-2. Читает текущую голову.
-3. `n.next = old` — новый узел указывает на старую голову.
-4. CAS: если голова не изменилась — устанавливает `n` как новую голову.
-5. Если изменилась — повторяет.
-
-### Pop
-
-```go
-func (s *Stack[T]) Pop() (T, bool) {
-    var zero T
-    for {
-        old := s.head.Load()
-        if old == nil {
-            return zero, false
-        }
-        next := old.next
-        if s.head.CompareAndSwap(old, next) {
-            return old.value, true
-        }
-        // Кто-то изменил head — повторяем
-    }
-}
-```
-
-**Что делает:**
-
-1. Читает текущую голову.
-2. Если пусто — возвращает `zero, false`.
-3. Читает `old.next`.
-4. CAS: если голова не изменилась — устанавливает `next` как новую голову.
-5. Если изменилась — повторяет.
+- Проверяем `ctx.Done()` в начале каждой попытки.
+- Ждём через `select` с `ctx.Done()`.
+- Если `ctx` отменён — возвращаем последнюю ошибку.
 
 ### Полный пример
 
@@ -1099,1111 +696,776 @@ func (s *Stack[T]) Pop() (T, bool) {
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
-    "sync"
-    "sync/atomic"
+    "time"
 )
 
-type node[T any] struct {
-    value T
-    next  *node[T]
-}
-
-type Stack[T any] struct {
-    head atomic.Pointer[node[T]]
-}
-
-func (s *Stack[T]) Push(value T) {
-    n := &node[T]{value: value}
-    for {
-        old := s.head.Load()
-        n.next = old
-        if s.head.CompareAndSwap(old, n) {
-            return
+func retryCtx(ctx context.Context, n int, baseDelay time.Duration, fn func(ctx context.Context) error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        select {
+        case <-ctx.Done():
+            if lastErr != nil {
+                return lastErr
+            }
+            return ctx.Err()
+        default:
+        }
+        
+        err := fn(ctx)
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        
+        if i < n-1 {
+            select {
+            case <-ctx.Done():
+                return lastErr
+            case <-time.After(delay):
+            }
+            delay *= 2
         }
     }
-}
-
-func (s *Stack[T]) Pop() (T, bool) {
-    var zero T
-    for {
-        old := s.head.Load()
-        if old == nil {
-            return zero, false
-        }
-        next := old.next
-        if s.head.CompareAndSwap(old, next) {
-            return old.value, true
-        }
-    }
+    return lastErr
 }
 
 func main() {
-    var s Stack[int]
-
-    var wg sync.WaitGroup
-    for i := 0; i < 100; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for j := 0; j < 100; j++ {
-                s.Push(id*100 + j)
-            }
-        }(i)
-    }
-    wg.Wait()
-
-    count := 0
-    for {
-        _, ok := s.Pop()
-        if !ok {
-            break
-        }
-        count++
-    }
-    fmt.Println("count:", count)  // 10000
+    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+    defer cancel()
+    
+    attempts := 0
+    start := time.Now()
+    
+    err := retryCtx(ctx, 10, 100*time.Millisecond, func(ctx context.Context) error {
+        attempts++
+        fmt.Printf("[%v] attempt %d\n", time.Since(start).Round(time.Millisecond), attempts)
+        return errors.New("temporary error")
+    })
+    
+    fmt.Println("error:", err)
 }
 ```
 
-### Проблемы Treiber stack
-
-**1. ABA problem.**
-
-См. 16.8.
-
-**2. Memory reclamation.**
-
-Когда освобождать `old` node? Если сразу — другая горутина может ещё держать указатель.
-
-**3. Contention на head.**
-
-Все операции — на `head`. При высокой конкуренции CAS «проваливается».
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `Push` (без contention) | ~10-20 нс |
-| `Push` (с contention) | ~100-1000 нс |
-| `Pop` (без contention) | ~10-20 нс |
-| `Pop` (с contention) | ~100-1000 нс |
-
-### 💡 Практика: как использовать Treiber stack
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`atomic.Pointer`** для головы.
-2. **CAS retry loop.**
-3. **Бенчмаркай** против mutex.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Hazard pointers** для memory reclamation.
-5. **Метрики** — сколько retry.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не освобождай узлы сразу** после Pop.
-7. **Не игнорируй ABA problem.**
-
-### Ключевые выводы подглавы 16.6
-
-- **Treiber stack** — lock-free стек.
-- **`atomic.Pointer`** для головы.
-- **CAS retry loop.**
-- **Проблемы:** ABA, memory reclamation, contention на head.
-
----
-
-## 16.7 Michael-Scott queue: lock-free очередь
-
-**Michael-Scott queue** — lock-free очередь.
-
-### Идея
-
-**Очередь** — FIFO. Операции: `Enqueue`, `Dequeue`.
-
-**Michael-Scott** использует **два** указателя: `head` и `tail`.
-
-**Проблема:** два указателя нужно обновлять атомарно.
-
-### Структура
-
-```go
-type node[T any] struct {
-    value T
-    next  atomic.Pointer[node[T]]
-}
-
-type Queue[T any] struct {
-    head atomic.Pointer[node[T]]
-    tail atomic.Pointer[node[T]]
-}
-```
-
-### Инициализация
-
-```go
-func NewQueue[T any]() *Queue[T] {
-    q := &Queue[T]{}
-    dummy := &node[T]{}
-    q.head.Store(dummy)
-    q.tail.Store(dummy)
-    return q
-}
-```
-
-**Ключевое:** есть **dummy node**. `head` и `tail` указывают на неё.
-
-### Enqueue
-
-```go
-func (q *Queue[T]) Enqueue(value T) {
-    n := &node[T]{value: value}
-    for {
-        tail := q.tail.Load()
-        next := tail.next.Load()
-        if tail == q.tail.Load() {  // tail не изменился
-            if next == nil {
-                // tail.next пуст — можно прицепить
-                if tail.next.CompareAndSwap(nil, n) {
-                    // Успех — пробуем сдвинуть tail
-                    q.tail.CompareAndSwap(tail, n)
-                    return
-                }
-            } else {
-                // Кто-то уже добавил — сдвигаем tail
-                q.tail.CompareAndSwap(tail, next)
-            }
-        }
-    }
-}
-```
-
-### Dequeue
-
-```go
-func (q *Queue[T]) Dequeue() (T, bool) {
-    var zero T
-    for {
-        head := q.head.Load()
-        tail := q.tail.Load()
-        next := head.next.Load()
-        if head == q.head.Load() {  // head не изменился
-            if head == tail {
-                // Очередь пуста?
-                if next == nil {
-                    return zero, false
-                }
-                // tail отстал — сдвигаем
-                q.tail.CompareAndSwap(tail, next)
-            } else {
-                // Читаем значение
-                value := next.value
-                // Сдвигаем head
-                if q.head.CompareAndSwap(head, next) {
-                    return value, true
-                }
-            }
-        }
-    }
-}
-```
-
-### Полный пример
-
-```go
-package main
-
-import (
-    "fmt"
-    "sync"
-    "sync/atomic"
-)
-
-type node[T any] struct {
-    value T
-    next  atomic.Pointer[node[T]]
-}
-
-type Queue[T any] struct {
-    head atomic.Pointer[node[T]]
-    tail atomic.Pointer[node[T]]
-}
-
-func NewQueue[T any]() *Queue[T] {
-    q := &Queue[T]{}
-    dummy := &node[T]{}
-    q.head.Store(dummy)
-    q.tail.Store(dummy)
-    return q
-}
-
-func (q *Queue[T]) Enqueue(value T) {
-    n := &node[T]{value: value}
-    for {
-        tail := q.tail.Load()
-        next := tail.next.Load()
-        if tail == q.tail.Load() {
-            if next == nil {
-                if tail.next.CompareAndSwap(nil, n) {
-                    q.tail.CompareAndSwap(tail, n)
-                    return
-                }
-            } else {
-                q.tail.CompareAndSwap(tail, next)
-            }
-        }
-    }
-}
-
-func (q *Queue[T]) Dequeue() (T, bool) {
-    var zero T
-    for {
-        head := q.head.Load()
-        tail := q.tail.Load()
-        next := head.next.Load()
-        if head == q.head.Load() {
-            if head == tail {
-                if next == nil {
-                    return zero, false
-                }
-                q.tail.CompareAndSwap(tail, next)
-            } else {
-                value := next.value
-                if q.head.CompareAndSwap(head, next) {
-                    return value, true
-                }
-            }
-        }
-    }
-}
-
-func main() {
-    q := NewQueue[int]()
-
-    var wg sync.WaitGroup
-    for i := 0; i < 100; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for j := 0; j < 100; j++ {
-                q.Enqueue(id*100 + j)
-            }
-        }(i)
-    }
-    wg.Wait()
-
-    count := 0
-    for {
-        _, ok := q.Dequeue()
-        if !ok {
-            break
-        }
-        count++
-    }
-    fmt.Println("count:", count)  // 10000
-}
-```
-
-### Проблемы Michael-Scott queue
-
-**1. Сложность.**
-
-Код сложнее, чем Treiber stack.
-
-**2. ABA problem.**
-
-См. 16.8.
-
-**3. Memory reclamation.**
-
-Когда освобождать узлы?
-
-**4. Contention на head/tail.**
-
-При высокой конкуренции — CAS contention.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `Enqueue` (без contention) | ~20-50 нс |
-| `Enqueue` (с contention) | ~100-1000 нс |
-| `Dequeue` (без contention) | ~20-50 нс |
-| `Dequeue` (с contention) | ~100-1000 нс |
-
-### 💡 Практика: как использовать Michael-Scott queue
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Dummy node** — для упрощения.
-2. **Два указателя** — `head` и `tail`.
-3. **CAS** для обоих.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Hazard pointers** для memory reclamation.
-5. **Бенчмаркай** против mutex-based queue.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не пиши lock-free queue с нуля** без необходимости.
-7. **Не игнорируй ABA problem.**
-
-### Ключевые выводы подглавы 16.7
-
-- **Michael-Scott queue** — lock-free очередь.
-- **Dummy node** для упрощения.
-- **Два указателя:** `head` и `tail`.
-- **Проблемы:** сложность, ABA, memory reclamation.
-
----
-
-## 16.8 ABA problem
-
-**ABA problem** — классическая проблема lock-free структур.
-
-### Что такое ABA
-
-**Сценарий:**
-
-1. Горутина A читает `value = X`.
-2. Горутина B меняет `value = Y`, потом `value = X`.
-3. Горутина A делает CAS: `value == X`, устанавливает `value = Z`.
-4. **Успех**, но состояние **изменилось** между чтением и CAS.
-
-**Проблема:** CAS не знает, что между чтением и записью что-то произошло.
-
-### Пример: Treiber stack
-
-**Сценарий:**
+**Пример вывода:**
 
 ```
-Начальное состояние: head → A → B → C
-
-1. Горутина 1 читает head = A, next = B.
-2. Горутина 1 приостанавливается.
-
-3. Горутина 2 делает Pop: head → B → C.
-4. Горутина 2 делает Pop: head → C.
-5. Горутина 2 делает Push A: head → A → C.
-   (узел A переиспользован)
-
-6. Горутина 1 продолжает: CAS(head, A, B).
-7. CAS успешен (head == A), head → B.
-8. Но B уже не в стеке! B.next = C, но C может быть изменён.
+[0s] attempt 1
+[100ms] attempt 2
+[300ms] attempt 3
+error: temporary error
 ```
 
-**Результат:** стек повреждён.
-
-### Как обнаружить
-
-**ABA problem** сложно обнаружить:
-
-- Проявляется **редко**.
-- Зависит от timing.
-- Может **не проявляться** годами.
-
-**Race detector** может **не найти** — это не data race, а **логическая** ошибка.
-
-### Решения
-
-**1. Tagged pointers.**
-
-Добавить **счётчик** к указателю. CAS проверяет и указатель, и счётчик.
-
-```go
-type taggedPtr struct {
-    ptr   *node
-    tag   uint64
-}
-```
-
-**Проблема:** в Go нет 128-битных атомарных операций.
-
-**2. Hazard pointers.**
-
-См. 16.9.
-
-**3. `atomic.Pointer` с version.**
-
-```go
-type versioned[T any] struct {
-    value T
-    ver   uint64
-}
-```
-
-**4. Не переиспользовать узлы.**
-
-Если узлы не переиспользуются (только новые) — ABA не возникает.
-
-**Минус:** утечка памяти.
-
-### В Go
-
-**Go не поддерживает** tagged pointers напрямую.
-
-**Альтернативы:**
-
-- **Hazard pointers** — сложно.
-- **`sync.Pool`** — не решает ABA.
-- **Избегать lock-free** для сложных структур.
-
-### Аннотация сложности
-
-| Решение | Сложность |
-|:---|:---|
-| Tagged pointers | Высокая (нет в Go) |
-| Hazard pointers | Высокая |
-| Не переиспользовать | Низкая (но утечка) |
-| Избегать lock-free | Низкая |
-
-### 💡 Практика: как избежать ABA
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Понимай ABA** — это не data race.
-2. **Избегай lock-free** для сложных структур.
-3. **Используй hazard pointers** если нужно.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Тесты** на ABA (сложно).
-5. **Код-ревью** lock-free структур.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не пиши lock-free структуры без понимания ABA.**
-7. **Не используй tagged pointers в Go.**
-
-### Ключевые выводы подглавы 16.8
-
-- **ABA problem** — CAS не видит изменения.
-- **Сложно обнаружить.**
-- **Решения:** tagged pointers, hazard pointers, не переиспользовать.
-- **В Go** — избегать lock-free для сложных структур.
-
----
-
-## 16.9 Hazard pointers
-
-**Hazard pointers** — механизм для безопасного освобождения памяти в lock-free структурах.
-
-### Проблема
-
-**Memory reclamation:** когда освобождать узлы?
-
-**Без hazard pointers:**
-
-- Горутина A читает `head = X`.
-- Горутина B удаляет X и освобождает.
-- Горутина A обращается к X → **use-after-free**.
-
-### Идея hazard pointers
-
-**Каждая горутина объявляет** указатели, к которым обращается.
-
-**Освобождение:**
-
-- Узел освобождается, только если **никто** его не объявил hazard.
+**Что видно:** на attempt 4 `ctx` отменён (500 мс истекли). Retry останавливается, возвращает последнюю ошибку.
 
 ### Схема
 
 ```
-Горутина A: hazard = X
-Горутина B: hazard = Y
-Горутина C: hazard = Z
+Retry с ctx:
 
-Освобождение:
-  - Узел X: НЕ освобождать (A объявил)
-  - Узел Y: НЕ освобождать (B объявил)
-  - Узел Z: НЕ освобождать (C объявил)
-  - Узел W: освободить (никто не объявил)
+  for i := 0; i < n; i++ {
+    select {
+    case <-ctx.Done():  ← отмена
+      return lastErr
+    default:
+    }
+    
+    err := fn(ctx)
+    if err == nil {
+      return nil
+    }
+    lastErr = err
+    
+    select {
+    case <-ctx.Done():  ← отмена
+      return lastErr
+    case <-time.After(delay):
+    }
+  }
 ```
 
-### Реализация
-
-**Упрощённая схема:**
-
-```go
-type HazardPointer struct {
-    ptrs []atomic.Pointer[node]
-}
-```
-
-**Каждая горутина:**
-
-1. Объявляет hazard перед чтением.
-2. Читает.
-3. Снимает hazard после.
-
-**При освобождении:**
-
-1. Собирает все hazard pointers.
-2. Если узел не в списке — освобождает.
-3. Иначе — откладывает.
-
-### Сложность
-
-**Hazard pointers сложны:**
-
-- Нужно управлять per-goroutine hazard pointers.
-- Нужно сканировать hazard pointers при освобождении.
-- Overhead на каждую операцию.
-
-**В Go нет встроенной поддержки.**
-
-**Библиотеки:**
-
-- `github.com/romshark/...` — редко.
-- Своя реализация — сложно.
-
-### Альтернативы
-
-**1. `sync.Pool`.**
-
-Не решает ABA, но уменьшает аллокации.
-
-**2. Не переиспользовать узлы.**
-
-Утечка, но безопасно.
-
-**3. Garbage collector.**
-
-В Go GC **сам** освобождает память. Если нет явного `free` — ABA problem **не возникает** (потому что узлы не переиспользуются).
-
-**Ключевое:** **в Go GC решает memory reclamation автоматически.** ABA problem **всё ещё возможен**, но **use-after-free** — нет.
-
-### Аннотация сложности
-
-| Механизм | Сложность | Overhead |
-|:---|:---|:---|
-| Hazard pointers | Высокая | ~10-50% |
-| Не переиспользовать | Низкая | Память |
-| GC (Go) | — | — |
-
-### 💡 Практика: как использовать hazard pointers
+### 💡 Практика: как добавить context
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Понимай, что hazard pointers нужны для C/C++.**
-2. **В Go GC решает большую часть проблем.**
-3. **ABA остаётся** — используй tagged или избегай.
+1. **`ctx context.Context` — первый аргумент.**
+2. **`fn(ctx)` — передавай ctx в callback.**
+3. **`select` с `ctx.Done()` при ожидании.**
+4. **Проверяй `ctx.Done()` в начале попытки.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **Библиотеки** если нужны.
+5. **`context.WithTimeout`** — общий таймаут retry.
 
 **❌ НЕ ДЕЛАЙ:**
 
-5. **Не пиши hazard pointers с нуля.**
-6. **Не игнорируй ABA.**
-
-### Ключевые выводы подглавы 16.9
-
-- **Hazard pointers** — для memory reclamation.
-- **Сложны** в реализации.
-- **В Go GC решает** memory reclamation.
-- **ABA остаётся** — используй tagged или избегай.
+6. **Не используй `time.Sleep` — используй `select`.**
+7. **Не блокируйся навсегда.**
 
 ---
 
-## 16.10 Когда lock-free хуже Mutex
+## 16.6 Permanent ошибки: когда не повторять
 
-Разберём **когда lock-free хуже**.
+Не все ошибки **временные**. Некоторые — **постоянные**. Retry **не поможет**.
 
-### 1. Высокая конкуренция
+### Какие ошибки permanent
 
-**Проблема:** CAS retry loop может «проваливаться» много раз.
+**HTTP:**
 
-**Пример:**
+- 400 Bad Request.
+- 401 Unauthorized.
+- 403 Forbidden.
+- 404 Not Found.
+- 405 Method Not Allowed.
+- 501 Not Implemented.
 
-```
-100 горутин делают CAS на одном указателе.
-Только одна выигрывает.
-99 повторяют.
-```
+**gRPC:**
 
-**Что происходит:** CPU тратится на retry, а не на работу.
+- `InvalidArgument`.
+- `Unauthenticated`.
+- `PermissionDenied`.
+- `NotFound`.
+- `Unimplemented`.
 
-**Mutex** в этом случае **быстрее**: горутины спят, а не крутятся.
+**БД:**
 
-### 2. Сложные структуры
+- Ошибки валидации.
+- Ошибки схемы.
+- Нарушение уникальности.
 
-**Проблема:** lock-free map, tree — очень сложны.
+### Как отличить permanent от временной
 
-**Пример:** lock-free hash map — сотни строк кода, сложная отладка.
-
-**Mutex-based** map — просто и работает.
-
-### 3. ABA problem
-
-**Проблема:** ABA сложно обнаружить и решить.
-
-**Mutex** не имеет ABA.
-
-### 4. Memory reclamation
-
-**Проблема:** в C/C++ нужно управлять памятью вручную.
-
-**В Go** GC решает, но ABA остаётся.
-
-### 5. Отладка
-
-**Проблема:** lock-free структуры сложно отлаживать.
-
-- Race detector может не найти.
-- ABA проявляется редко.
-- Логика сложная.
-
-### 6. Бенчмарки
-
-**Часто mutex быстрее.**
-
-**Пример:**
+**Способ 1: тип ошибки.**
 
 ```go
-// Mutex-based stack
-type MutexStack struct {
-    mu sync.Mutex
-    head *node
+type PermanentError struct {
+    Code int
+    Msg  string
 }
 
-// Lock-free stack (Treiber)
-type LockFreeStack struct {
-    head atomic.Pointer[node]
+func (e *PermanentError) Error() string {
+    return fmt.Sprintf("permanent error %d: %s", e.Code, e.Msg)
 }
 ```
 
-**Бенчмарк (8 ядер, 100 горутин):**
+**В коде:**
+
+```go
+if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429 {
+    return &PermanentError{Code: resp.StatusCode}
+}
+```
+
+**При retry:**
+
+```go
+err := fn()
+if err == nil {
+    return nil
+}
+
+var permErr *PermanentError
+if errors.As(err, &permErr) {
+    return err  // не retry
+}
+```
+
+### Способ 2: HTTP-код
+
+```go
+func shouldRetry(statusCode int) bool {
+    switch statusCode {
+    case 429:              // Too Many Requests — retry
+        return true
+    }
+    if statusCode >= 500 && statusCode != 501 {
+        return true  // 5xx — retry
+    }
+    return false
+}
+```
+
+**Что retry:**
+
+- 429 — Too Many Requests.
+- 500 — Internal Server Error.
+- 502 — Bad Gateway.
+- 503 — Service Unavailable.
+- 504 — Gateway Timeout.
+
+**Что НЕ retry:**
+
+- 400, 401, 403, 404, 405, 501.
+
+### Полная реализация
+
+```go
+func retryWithPermanentCheck(ctx context.Context, n int, baseDelay time.Duration, fn func(ctx context.Context) error) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        select {
+        case <-ctx.Done():
+            if lastErr != nil {
+                return lastErr
+            }
+            return ctx.Err()
+        default:
+        }
+        
+        err := fn(ctx)
+        if err == nil {
+            return nil
+        }
+        
+        var permErr *PermanentError
+        if errors.As(err, &permErr) {
+            return err  // не retry
+        }
+        
+        lastErr = err
+        
+        if i < n-1 {
+            select {
+            case <-ctx.Done():
+                return lastErr
+            case <-time.After(delay):
+            }
+            delay *= 2
+        }
+    }
+    return lastErr
+}
+```
+
+### Схема
 
 ```
-BenchmarkMutexStack-8      1000000    1500 ns/op
-BenchmarkLockFreeStack-8   1000000    2500 ns/op
+Retry с проверкой permanent:
+
+  err := fn(ctx)
+  if err == nil {
+    return nil
+  }
+  
+  if isPermanent(err) {  ← проверка
+    return err           ← не retry
+  }
+  
+  // retry
 ```
 
-**Что видно:** mutex **быстрее** из-за CAS contention.
-
-### Сравнение
-
-| Аспект | Mutex | Lock-free |
-|:---|:---|:---|
-| Низкая конкуренция | ~25 нс | ~10 нс |
-| Высокая конкуренция | ~100-1000 нс | ~1000-10000 нс |
-| Сложность | Низкая | Высокая |
-| ABA | Нет | Есть |
-| Memory reclamation | Нет | Сложно |
-| Отладка | Легко | Сложно |
-
-### Аннотация сложности
-
-| Сценарий | Mutex | Lock-free |
-|:---|:---|:---|
-| 1 горутина | ~15-25 нс | ~10-20 нс |
-| 8 горутин | ~100-200 нс | ~50-100 нс |
-| 100 горутин | ~1000 нс | ~5000 нс |
-
-### 💡 Практика: когда lock-free хуже
+### 💡 Практика: как обрабатывать permanent ошибки
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Бенчмаркай** перед выбором.
-2. **Mutex** для сложных структур.
-3. **Lock-free** только для простых.
+1. **`PermanentError` — тип для постоянных.**
+2. **`errors.As` — проверка.**
+3. **`shouldRetry(statusCode)` — по HTTP-коду.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **`atomic`** для счётчиков.
-5. **Sharding** для map.
+4. **Логирование permanent ошибок.**
+5. **Метрики для permanent.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-6. **Не пиши lock-free без необходимости.**
-7. **Не игнорируй contention.**
-
-### Ключевые выводы подглавы 16.10
-
-- **Lock-free хуже** при высокой конкуренции, сложных структурах, ABA.
-- **Mutex** часто быстрее.
-- **Бенчмаркай** перед выбором.
-- **Lock-free** только для простых структур.
+6. **Не retry 4xx (кроме 429).**
+7. **Не retry ошибки валидации.**
 
 ---
 
-## 16.11 Практика Go: бенчмарки конкурентных структур
+## 16.7 В связке с другими паттернами
 
-Напишем **бенчмарки** для сравнения.
+Retry редко используется **в одиночку**. Разберём связки.
 
-### Код
+### Retry + circuit breaker
+
+**Retry** повторяет. **Circuit breaker** прекращает, если retry не помогает.
 
 ```go
-package benchmarks
+func fetchWithRetryAndBreaker(ctx context.Context, cb *CircuitBreaker, url string) (*http.Response, error) {
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        var resp *http.Response
+        err := cb.Call(ctx, func(ctx context.Context) error {
+            req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+            if err != nil {
+                return err
+            }
+            var reqErr error
+            resp, reqErr = http.DefaultClient.Do(req)
+            return reqErr
+        })
+        if err == nil {
+            return resp, nil
+        }
+        if errors.Is(err, ErrCircuitOpen) {
+            return nil, err  // не retry
+        }
+        lastErr = err
+        
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+        }
+    }
+    return nil, lastErr
+}
+```
+
+**Порядок:**
+
+1. **Circuit breaker** — оборачивает HTTP.
+2. **Retry** — вокруг breaker.
+3. **Не retry при `ErrCircuitOpen`.**
+
+### Retry + rate limiter
+
+**Rate limiter** ограничивает скорость. **Retry** — повторяет.
+
+```go
+func fetchWithRetryAndLimiter(ctx context.Context, limiter *rate.Limiter, url string) (*http.Response, error) {
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        if err := limiter.Wait(ctx); err != nil {
+            return nil, err
+        }
+        
+        resp, err := http.Get(url)
+        if err == nil {
+            return resp, nil
+        }
+        lastErr = err
+        
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+        }
+    }
+    return nil, lastErr
+}
+```
+
+### Retry + worker pool
+
+**Worker pool** обрабатывает задачи. **Retry** — внутри воркера.
+
+```go
+func worker(ctx context.Context, tasksCh <-chan Task) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case task, ok := <-tasksCh:
+            if !ok {
+                return
+            }
+            err := retryCtx(ctx, 3, 100*time.Millisecond, func(ctx context.Context) error {
+                return process(ctx, task)
+            })
+            if err != nil {
+                log.Printf("task %d failed after retries: %v", task.ID, err)
+            }
+        }
+    }
+}
+```
+
+### Полная защита
+
+```
+Запрос
+   │
+   ▼
+┌──────────────┐
+│ Rate limiter │  ← не более RPS
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│    Retry     │  ← 3 попытки
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Circuit    │  ← защита от сбоев
+│   breaker    │
+└──────┬───────┘
+       │
+       ▼
+     HTTP
+```
+
+**Порядок:**
+
+1. **Rate limiter** — первым.
+2. **Retry** — вокруг breaker.
+3. **Circuit breaker** — оборачивает HTTP.
+
+### 💡 Практика: как комбинировать retry
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Retry + circuit breaker** — полная защита.
+2. **Rate limiter → retry → breaker → HTTP.**
+3. **Не retry при open breaker.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Retry + worker pool** — для задач.
+5. **Retry + rate limiter** — для внешних API.
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не retry бесконечно.**
+7. **Не забывай про jitter.**
+
+---
+
+## 16.8 Практика Go: retry с метриками
+
+Разберём **retry с метриками**.
+
+### Полный код
+
+```go
+package main
 
 import (
-    "sync"
+    "context"
+    "errors"
+    "fmt"
+    "math/rand"
     "sync/atomic"
-    "testing"
+    "time"
 )
 
-// Mutex-based counter
-type MutexCounter struct {
-    mu sync.Mutex
-    n  int64
+type Metrics struct {
+    Attempts     atomic.Int64
+    Successes    atomic.Int64
+    Failures     atomic.Int64
+    TotalWait    atomic.Int64
+    PermanentErr atomic.Int64
 }
 
-func (c *MutexCounter) Inc() {
-    c.mu.Lock()
-    c.n++
-    c.mu.Unlock()
+type PermanentError struct {
+    Code int
 }
 
-// Atomic counter
-type AtomicCounter struct {
-    n atomic.Int64
+func (e *PermanentError) Error() string {
+    return fmt.Sprintf("permanent error %d", e.Code)
 }
 
-func (c *AtomicCounter) Inc() {
-    c.n.Add(1)
-}
-
-// Sharded counter
-type ShardedCounter struct {
-    shards [256]struct {
-        pad [56]byte
-        n   atomic.Int64
-    }
-}
-
-func (c *ShardedCounter) Inc() {
-    // Для бенчмарка — просто round-robin
-    c.shards[0].n.Add(1)
-}
-
-func BenchmarkMutexCounter(b *testing.B) {
-    var c MutexCounter
-    b.RunParallel(func(pb *testing.PB) {
-        for pb.Next() {
-            c.Inc()
+func retryCtx(ctx context.Context, n int, baseDelay, maxDelay time.Duration, fn func(ctx context.Context) error, metrics *Metrics) error {
+    var lastErr error
+    delay := baseDelay
+    
+    for i := 0; i < n; i++ {
+        select {
+        case <-ctx.Done():
+            if lastErr != nil {
+                return lastErr
+            }
+            return ctx.Err()
+        default:
         }
-    })
-}
-
-func BenchmarkAtomicCounter(b *testing.B) {
-    var c AtomicCounter
-    b.RunParallel(func(pb *testing.PB) {
-        for pb.Next() {
-            c.Inc()
+        
+        metrics.Attempts.Add(1)
+        err := fn(ctx)
+        if err == nil {
+            metrics.Successes.Add(1)
+            return nil
         }
-    })
-}
-
-// Mutex-based stack
-type MutexStack struct {
-    mu   sync.Mutex
-    head *node
-}
-
-type node struct {
-    value int
-    next  *node
-}
-
-func (s *MutexStack) Push(v int) {
-    s.mu.Lock()
-    s.head = &node{value: v, next: s.head}
-    s.mu.Unlock()
-}
-
-// Treiber stack
-type TreiberStack struct {
-    head atomic.Pointer[node]
-}
-
-func (s *TreiberStack) Push(v int) {
-    n := &node{value: v}
-    for {
-        old := s.head.Load()
-        n.next = old
-        if s.head.CompareAndSwap(old, n) {
-            return
+        
+        var permErr *PermanentError
+        if errors.As(err, &permErr) {
+            metrics.PermanentErr.Add(1)
+            return err
+        }
+        
+        lastErr = err
+        metrics.Failures.Add(1)
+        
+        if i < n-1 {
+            // Jitter: delay ± 50%
+            jitter := time.Duration(rand.Int63n(int64(delay))) - delay/2
+            wait := delay + jitter
+            metrics.TotalWait.Add(int64(wait))
+            
+            select {
+            case <-ctx.Done():
+                return lastErr
+            case <-time.After(wait):
+            }
+            
+            delay *= 2
+            if delay > maxDelay {
+                delay = maxDelay
+            }
         }
     }
+    return lastErr
 }
 
-func BenchmarkMutexStack(b *testing.B) {
-    var s MutexStack
-    b.RunParallel(func(pb *testing.PB) {
-        for pb.Next() {
-            s.Push(1)
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    metrics := &Metrics{}
+    attempts := 0
+    
+    start := time.Now()
+    err := retryCtx(ctx, 5, 100*time.Millisecond, 1*time.Second, func(ctx context.Context) error {
+        attempts++
+        if attempts < 3 {
+            return errors.New("temporary error")
         }
-    })
+        return nil
+    }, metrics)
+    
+    fmt.Printf("Error: %v\n", err)
+    fmt.Printf("Elapsed: %v\n\n", time.Since(start))
+    
+    fmt.Println("=== Metrics ===")
+    fmt.Printf("Attempts:     %d\n", metrics.Attempts.Load())
+    fmt.Printf("Successes:    %d\n", metrics.Successes.Load())
+    fmt.Printf("Failures:     %d\n", metrics.Failures.Load())
+    fmt.Printf("PermanentErr: %d\n", metrics.PermanentErr.Load())
+    fmt.Printf("TotalWait:    %v\n", time.Duration(metrics.TotalWait.Load()))
 }
+```
 
-func BenchmarkTreiberStack(b *testing.B) {
-    var s TreiberStack
-    b.RunParallel(func(pb *testing.PB) {
-        for pb.Next() {
-            s.Push(1)
-        }
-    })
+**Пример вывода:**
+
+```
+Error: <nil>
+Elapsed: 235ms
+
+=== Metrics ===
+Attempts:     3
+Successes:    1
+Failures:     2
+PermanentErr: 0
+TotalWait:    235ms
+```
+
+### Пример: retry с permanent ошибкой
+
+```go
+func main() {
+    ctx := context.Background()
+    metrics := &Metrics{}
+    
+    err := retryCtx(ctx, 5, 100*time.Millisecond, 1*time.Second, func(ctx context.Context) error {
+        return &PermanentError{Code: 404}
+    }, metrics)
+    
+    fmt.Printf("Error: %v\n", err)
+    fmt.Printf("Attempts: %d\n", metrics.Attempts.Load())
+    fmt.Printf("PermanentErr: %d\n", metrics.PermanentErr.Load())
 }
 ```
 
-### Запуск
-
-```bash
-go test -bench=. -benchmem -cpu=1,2,4,8 ./...
-```
-
-### Пример вывода
+**Пример вывода:**
 
 ```
-BenchmarkMutexCounter-1     50000000    25 ns/op
-BenchmarkMutexCounter-8     10000000   150 ns/op
-BenchmarkAtomicCounter-1   100000000    10 ns/op
-BenchmarkAtomicCounter-8    50000000    25 ns/op
-BenchmarkMutexStack-1       30000000    40 ns/op
-BenchmarkMutexStack-8        5000000   300 ns/op
-BenchmarkTreiberStack-1     20000000    60 ns/op
-BenchmarkTreiberStack-8      3000000   500 ns/op
+Error: permanent error 404
+Attempts: 1
+PermanentErr: 1
 ```
 
-**Что видно:**
+**Что видно:** попытка **одна** — permanent ошибка **не повторяется**.
 
-- **`atomic` быстрее `Mutex`** в 6 раз при 8 ядрах.
-- **`Mutex` stack быстрее Treiber** при 8 ядрах.
-
-### Анализ
-
-**`atomic` vs `Mutex`:**
-
-- `atomic` — нет блокировки, нет contention (для одного счётчика).
-- `Mutex` — contention растёт с `GOMAXPROCS`.
-
-**Mutex stack vs Treiber:**
-
-- Mutex — горутины спят.
-- Treiber — CAS retry, contention на head.
-
-### Аннотация сложности
-
-| Структура | 1 ядро | 8 ядер |
-|:---|:---|:---|
-| Mutex counter | ~25 нс | ~150 нс |
-| Atomic counter | ~10 нс | ~25 нс |
-| Mutex stack | ~40 нс | ~300 нс |
-| Treiber stack | ~60 нс | ~500 нс |
-
-### 💡 Практика: как бенчмаркать
+### 💡 Практика: как измерять retry
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **`b.RunParallel`** — для параллельных.
-2. **`-cpu=1,2,4,8`** — разные GOMAXPROCS.
-3. **`-benchmem`** — память.
+1. **Метрики:** attempts, successes, failures, permanentErr.
+2. **TotalWait** — сколько времени ушло на задержки.
+3. **Экспорт в Prometheus.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **Реалистичная нагрузка** — не только 1 операция.
-5. **Разные размеры** — 10, 100, 1000 элементов.
+4. **Логирование каждой попытки.**
+5. **Мониторинг permanent ошибок.**
 
 **❌ НЕ ДЕЛАЙ:**
 
-6. **Не сравнивай несравнимое.**
-7. **Не игнорируй `-benchmem`.**
-
-### Ключевые выводы подглавы 16.11
-
-- **`b.RunParallel`** — для параллельных бенчмарков.
-- **`atomic` быстрее `Mutex`** для счётчиков.
-- **Mutex stack быстрее Treiber** при высокой конкуренции.
-- **`-cpu=1,2,4,8`** — обязательно.
+6. **Не используй `Mutex` для метрик.**
+7. **Не игнорируй retry в метриках.**
 
 ---
 
-## 16.12 Выводы и типичные ошибки
+## 16.9 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-Contention на одном мьютексе — bottleneck. Sharding — разбиение на N частей, каждая со своим мьютексом. Sharded map — Generic, N = 2^k, `& mask`. Когда sharding оправдан: высокий contention, write-heavy, большая map. Lock-free — без мьютексов, через CAS. Treiber stack — lock-free стек. Michael-Scott queue — lock-free очередь. ABA problem — CAS не видит изменения. Hazard pointers — для memory reclamation. Lock-free хуже Mutex при высокой конкуренции и сложных структурах.
+Retry — паттерн повторных попыток для временных ошибок. **Простейший** — N попыток без задержки (плохо). **С задержкой** — фиксированная (плохо) или экспоненциальный backoff (хорошо). **Jitter** — случайный разброс, предотвращает thundering herd. **`context`** — для отмены. **Permanent ошибки** (4xx) — не повторять. Retry комбинируется с circuit breaker, rate limiter, worker pool.
 
 **Типичные ошибки:**
 
-- ❌ **Один мьютекс на map.** Sharding.
-- ❌ **Sharding без причины.** Overhead.
-- ❌ **Плохой хэш.** Ключи в один шард.
-- ❌ **`fmt.Sprintf` в hot path.** Медленно.
-- ❌ **Не использовать `& mask`.** `% N` медленнее.
-- ❌ **Писать lock-free без необходимости.** Сложно.
-- ❌ **Игнорировать ABA problem.** Сложно отладить.
-- ❌ **Не освобождать память в lock-free.** Утечка.
-- ❌ **Освобождать сразу.** Use-after-free.
-- ❌ **Lock-free для сложных структур.** Mutex проще.
-- ❌ **Не бенчмаркать.** Может быть медленнее.
-- ❌ **Не использовать `-cpu=1,2,4,8`.**
+- ❌ **Retry без задержки.** DDOS на сервис.
+- ❌ **Фиксированная задержка.** Не адаптируется.
+- ❌ **Экспоненциальный backoff без cap.** Растёт бесконечно.
+- ❌ **Нет jitter.** Thundering herd.
+- ❌ **Нет `context`.** Блокировка навсегда.
+- ❌ **Retry permanent ошибки.** 4xx повторятся.
+- ❌ **Retry не-идемпотентные операции.** Задвоение.
+- ❌ **Retry при open breaker.** Ухудшает ситуацию.
+- ❌ **Слишком много попыток.** 10+ — опасно.
+- ❌ **Нет метрик.** Не видно эффекта.
 
 ---
 
-## 16.13 Для быстрого повторения
+## 16.10 Для быстрого повторения
 
-- **Contention** — конкуренция за один ресурс.
-- **Sharding** — N частей, каждая со своим мьютексом.
-- **N = 2^k**, близко к числу ядер.
-- **`& mask`** вместо `% N`.
-- **Хэш:** `fnv`, `maphash`.
-- **Sharded map** — Generic, RWMutex в каждом шарде.
-- **Когда оправдан:** высокий contention, write-heavy, большая map.
-- **Lock-free** — через CAS.
-- **Treiber stack** — lock-free стек.
-- **Michael-Scott queue** — lock-free очередь.
-- **ABA problem** — CAS не видит изменения.
-- **Hazard pointers** — для memory reclamation.
-- **Lock-free хуже Mutex** при высокой конкуренции.
-- **Бенчмаркай** с `-cpu=1,2,4,8`.
-- **`atomic` быстрее `Mutex`** для счётчиков.
-- **Mutex stack быстрее Treiber** при 8 ядрах.
+- **Retry** — паттерн повторных попыток для временных ошибок.
+- **N попыток 3–5** — разумно.
+- **Экспоненциальный backoff** — стандарт.
+- **Base delay 50–200 мс.** **Max delay 1–5 сек.**
+- **Jitter** — случайный разброс, ± 50%.
+- **`context`** — для отмены.
+- **Permanent ошибки** (4xx, кроме 429) — не retry.
+- **Тип `PermanentError`** — для постоянных.
+- **`errors.As`** — проверка.
+- **Retry + circuit breaker** — полная защита.
+- **Порядок:** rate limiter → retry → breaker → HTTP.
+- **Метрики:** attempts, successes, failures, permanentErr.
 
 ---
 
-## 16.14 Вопросы для самопроверки
+## 16.11 Вопросы для самопроверки
 
-1. Что такое contention?
-2. Как обнаружить contention?
-3. Что такое sharding?
-4. Как выбрать N шардов?
-5. Почему `& mask` быстрее `% N`?
-6. Какие хэш-функции использовать?
-7. Когда sharding оправдан?
-8. Когда sharding не нужен?
-9. Что такое lock-free?
-10. Что такое CAS?
-11. Как работает Treiber stack?
-12. Как работает Michael-Scott queue?
-13. Что такое ABA problem?
-14. Как решить ABA problem?
-15. Что такое hazard pointers?
-16. Когда lock-free хуже Mutex?
-17. Как бенчмаркать конкурентные структуры?
-18. Почему `atomic` быстрее `Mutex`?
+1. Что такое retry? Какую задачу решает?
+2. Чем retry отличается от circuit breaker?
+3. Что такое экспоненциальный backoff?
+4. Зачем нужен jitter?
+5. Зачем `context` в retry?
+6. Какие ошибки не нужно повторять?
+7. Как комбинировать retry с circuit breaker?
+8. Что будет, если retry без задержки?
 
 ---
 
-## 16.15 Ответы
+## 16.12 Ответы
 
 ### Ответ 1
 
-**Contention** — конкуренция за один ресурс. Горутины ждут друг друга.
+**Retry** — паттерн повторных попыток для **временных** ошибок. Решает задачу: **не отдавать клиенту ошибку**, если она может быть временной (сеть, перегрузка, БД).
 
 ### Ответ 2
 
-**Mutex profile:**
+**Retry** повторяет операции. **Circuit breaker** прекращает вызовы, если сервис **гарантированно** не работает.
 
-```go
-runtime.SetMutexProfileFraction(1)
-```
-
-```bash
-go tool pprof mutex.prof
-```
+**Вместе:** retry повторяет до N раз; если N раз упало — circuit breaker открывается.
 
 ### Ответ 3
 
-**Sharding** — разбиение структуры на N частей, каждая со своим мьютексом.
+**Экспоненциальный backoff** — задержка **удваивается** с каждой попыткой:
+
+```
+attempt 1: 100 мс
+attempt 2: 200 мс
+attempt 3: 400 мс
+attempt 4: 800 мс
+```
+
+**Зачем:** первая попытка быстро, следующая через время, чтобы сервис восстановился.
+
+**Cap:** максимальная задержка (1–5 сек), чтобы backoff не рос бесконечно.
 
 ### Ответ 4
 
-**N = 2^k**, близко к числу ядер. Обычно 2 × число ядер.
+**Jitter** — случайный разброс задержки. Предотвращает **thundering herd**: когда 1000 клиентов одновременно делают retry — все попадают в одну точку времени.
+
+**С jitter:** запросы **распределяются** во времени.
+
+**Реализация:** `delay ± 50%` или `0..delay`.
 
 ### Ответ 5
 
-**`& mask` быстрее `% N`**, потому что деление медленнее битовой операции.
+**`context`** позволяет остановить retry при отмене. Без него retry может **блокироваться навсегда** или работать, даже если клиент ушёл.
+
+**Решение:** `select` с `ctx.Done()` при ожидании, `fn(ctx)` для передачи контекста.
 
 ### Ответ 6
 
-**Хэш:** `fnv`, `maphash`, `xxhash`.
+**Permanent ошибки:**
+- 400 Bad Request.
+- 401 Unauthorized.
+- 403 Forbidden.
+- 404 Not Found.
+- 405 Method Not Allowed.
+- 501 Not Implemented.
+
+**Retry не поможет.** Эти ошибки повторятся.
 
 ### Ответ 7
 
-**Sharding оправдан:** высокий contention, write-heavy, большая map.
+**Retry + circuit breaker:**
+
+```go
+for attempt := 0; attempt < 3; attempt++ {
+    err := breaker.Call(ctx, func(ctx context.Context) error {
+        return http.Get(url)
+    })
+    if err == nil {
+        return nil
+    }
+    if errors.Is(err, ErrCircuitOpen) {
+        return err  // не retry
+    }
+    time.Sleep(backoff)
+}
+```
+
+Retry вокруг breaker. Не retry при открытом breaker.
 
 ### Ответ 8
 
-**Не оправдан:** низкий contention, read-only, малая map.
+**Retry без задержки:** DDOS на сервис. Если 1000 клиентов получили ошибку — все одновременно делают retry. Сервис **снова** перегружается.
 
-### Ответ 9
-
-**Lock-free** — структуры без мьютексов, через CAS.
-
-### Ответ 10
-
-**CAS** — Compare-And-Swap. Атомарная «замена, если равно».
-
-### Ответ 11
-
-**Treiber stack** — lock-free стек. `atomic.Pointer` на head. CAS retry loop.
-
-### Ответ 12
-
-**Michael-Scott queue** — lock-free очередь. Два указателя: head и tail. Dummy node.
-
-### Ответ 13
-
-**ABA problem** — CAS не видит, что значение изменилось A→B→A.
-
-### Ответ 14
-
-**Решения:** tagged pointers, hazard pointers, не переиспользовать.
-
-### Ответ 15
-
-**Hazard pointers** — механизм для memory reclamation. Каждая горутина объявляет указатели.
-
-### Ответ 16
-
-**Lock-free хуже** при высокой конкуренции, сложных структурах, ABA.
-
-### Ответ 17
-
-**`b.RunParallel`** + **`-cpu=1,2,4,8`** + **`-benchmem`**.
-
-### Ответ 18
-
-**`atomic` быстрее `Mutex`**, потому что нет блокировки и нет contention (для одного счётчика).
+**Решение:** экспоненциальный backoff + jitter.
 
 ---
 
-## 16.16 Куда идти дальше?
+## 16.13 Куда идти дальше?
 
-Мы разобрали sharded locks и lock-free структуры. Теперь мы умеем уменьшать contention.
+Мы разобрали retry — повторные попытки. Теперь мы умеем не отдавать клиенту временные ошибки.
 
-Но остаётся **следующая тема**: как переиспользовать объекты и как устроен аллокатор памяти?
+Но иногда операция **зависает**. Нужно **ограничить** время выполнения.
 
-- **Как переиспользовать объекты?** `sync.Pool`, escape analysis, аллокатор. → **Глава 17: sync.Pool и аллокатор памяти.**
-- **Как GC влияет на конкурентный код?** Tri-color, write barrier, STW паузы. → **Глава 18: GC и его влияние на конкурентный код.**
-- **Как строить отказоустойчивые системы?** Bulkhead, retry, leader election. → **Глава 19: Продвинутые паттерны.**
+- **Как ограничить время операции?** → **Глава 17: Timeout.**
+- **Как ограничить частоту операций?** → **Глава 18: Debounce и Throttle.**
+- **Как построить pipeline?** → **Глава 11: Pipeline.**
 
 ---
 
-## 16.17 Чек-лист
+## 16.14 Чек-лист
 
 | Компонент | Что это | Ключевые факты |
 |:---|:---|:---|
-| **Contention** | Конкуренция за ресурс | O(N × T_hold) |
-| **Sharding** | Разбиение на N частей | N = 2^k, `& mask` |
-| **Хэш** | Определяет шард | `fnv`, `maphash` |
-| **Sharded map** | N шардов | Generic, RWMutex |
-| **Когда оправдан** | Высокий contention | Write-heavy |
-| **Lock-free** | Без мьютексов | CAS |
-| **CAS** | Compare-And-Swap | Атомарная замена |
-| **Retry loop** | Паттерн lock-free | Load → compute → CAS |
-| **Treiber stack** | Lock-free стек | `atomic.Pointer` head |
-| **Michael-Scott** | Lock-free очередь | head + tail + dummy |
-| **ABA problem** | CAS не видит изменения | A→B→A |
-| **Hazard pointers** | Memory reclamation | Per-goroutine |
-| **Lock-free хуже** | При конкуренции | Mutex быстрее |
-| **Бенчмарки** | `b.RunParallel` | `-cpu=1,2,4,8` |
-| **`atomic`** | Быстрее `Mutex` | ~10 нс vs ~25 нс |
+| **Retry** | Повторные попытки | Для временных ошибок |
+| **N попыток** | 3–5 | Разумно |
+| **Задержка** | Между попытками | Обязательна |
+| **Экспоненциальный backoff** | Удвоение | Стандарт |
+| **Base delay** | 50–200 мс | Первая задержка |
+| **Max delay** | 1–5 сек | Cap |
+| **Jitter** | ± 50% | Предотвращает thundering herd |
+| **`context`** | Отмена | `select` с `ctx.Done()` |
+| **Permanent ошибки** | 4xx | Не retry |
+| **`PermanentError`** | Тип | Для постоянных |
+| **`errors.As`** | Проверка | — |
+| **Retry + breaker** | Полная защита | Не retry при open |
+| **Порядок** | Rate → retry → breaker → HTTP | — |
+| **Метрики** | attempts, successes, failures | PermanentErr |
 
-🧩 **Ключевая идея:** Contention на одном мьютексе — bottleneck. **Sharding** — разбиение на N частей, каждая со своим мьютексом. N = 2^k, близко к числу ядер. `& mask` вместо `% N`. Sharded map — Generic, RWMutex в каждом шарде. Когда sharding оправдан: высокий contention, write-heavy, большая map. **Lock-free** — без мьютексов, через CAS. Treiber stack — lock-free стек. Michael-Scott queue — lock-free очередь. **ABA problem** — CAS не видит изменения A→B→A. Решения: tagged pointers, hazard pointers, не переиспользовать. **Hazard pointers** — для memory reclamation. **Lock-free хуже Mutex** при высокой конкуренции и сложных структурах. **Бенчмаркай** с `-cpu=1,2,4,8`. `atomic` быстрее `Mutex` для счётчиков. Mutex stack быстрее Treiber при 8 ядрах.
+🔁 **Ключевая идея:** Retry — паттерн повторных попыток для временных ошибок. **N попыток 3–5**. **Экспоненциальный backoff** (base 50–200 мс, max 1–5 сек) — стандарт. **Jitter** (± 50%) предотвращает thundering herd. **`context`** для отмены. **Permanent ошибки** (4xx, кроме 429) не retry. Тип `PermanentError` + `errors.As`. Комбинируется с circuit breaker (не retry при open), rate limiter (rate → retry → breaker → HTTP), worker pool. Метрики: attempts, successes, failures, permanentErr. Не retry без задержки — DDOS на сервис.

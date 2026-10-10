@@ -1,2083 +1,1497 @@
-# 🌐 Глава 20: WebSocket, SSE, gRPC streaming
+# 🔮 Глава 20: Future/Promise — результат в будущем
 
 **Что вы узнаете:**
-- Почему **HTTP request/response** не подходит для real-time.
-- Что такое **WebSocket** и как он работает.
-- Как построить **WebSocket-сервер** на Go с hub-паттерном.
-- Что такое **Server-Sent Events (SSE)** и чем он отличается от WebSocket.
-- Как реализовать **gRPC bidirectional streaming**.
-- Что такое **backpressure** в streaming.
-- Как делать **heartbeat** и **reconnect**.
-- Как **graceful shutdown** для streaming-соединений.
-- Как **масштабировать** streaming на несколько узлов.
-- Как **тестировать** streaming.
+- Что такое future и какую задачу он решает.
+- Чем future отличается от обычной горутины с каналом.
+- Как построить простейший future.
+- Как добавить отмену через `context`.
+- Как обрабатывать ошибки.
+- Как комбинировать несколько future'ов.
+- Как избежать утечек и deadlock.
 
 **После прочтения вы сможете:**
-- Построить WebSocket-сервер с hub-паттерном.
-- Реализовать SSE для односторонней передачи.
-- Написать gRPC bidirectional streaming.
-- Обрабатывать backpressure в streaming.
-- Делать heartbeat и graceful shutdown.
-- Масштабировать streaming через pub/sub.
-- Тестировать streaming-соединения.
+- Построить future с нуля.
+- Запускать операции в фоне.
+- Получать результат позже.
+- Обрабатывать ошибки из future.
+- Комбинировать future'ы.
+- Понимать, где future уместен, а где — нет.
 
 ---
 
 ## Содержание
 
-- [20.0 Пролог: чат, который не масштабируется](#200-пролог-чат-который-не-масштабируется)
-- [20.1 Почему HTTP не подходит для real-time](#201-почему-http-не-подходит-для-real-time)
-- [20.2 WebSocket: полнодуплексный канал](#202-websocket-полнодуплексный-канал)
-- [20.3 WebSocket-сервер: hub-паттерн](#203-websocket-сервер-hub-паттерн)
-- [20.4 Server-Sent Events: односторонний поток](#204-server-sent-events-односторонний-поток)
-- [20.5 gRPC bidirectional streaming](#205-grpc-bidirectional-streaming)
-- [20.6 Backpressure в streaming](#206-backpressure-в-streaming)
-- [20.7 Heartbeat и reconnect](#207-heartbeat-и-reconnect)
-- [20.8 Graceful shutdown для streaming](#208-graceful-shutdown-для-streaming)
-- [20.9 Масштабирование streaming](#209-масштабирование-streaming)
-- [20.10 Практика Go: WebSocket-чат с hub](#2010-практика-go-websocket-чат-с-hub)
-- [20.11 Выводы и типичные ошибки](#2011-выводы-и-типичные-ошибки)
-- [20.12 Для быстрого повторения](#2012-для-быстрого-повторения)
-- [20.13 Вопросы для самопроверки](#2013-вопросы-для-самопроверки)
-- [20.14 Ответы](#2014-ответы)
-- [20.15 Куда идти дальше?](#2015-куда-идти-дальше)
-- [20.16 Чек-лист](#2016-чек-лист)
+- [20.0 Пролог: параллельные запросы](#200-пролог-параллельные-запросы)
+- [20.1 Что такое future](#201-что-такое-future)
+- [20.2 Простейший future](#202-простейший-future)
+- [20.3 Future с context](#203-future-с-context)
+- [20.4 Future с ошибками](#204-future-с-ошибками)
+- [20.5 Комбинирование future'ов](#205-комбинирование-futureов)
+- [20.6 Future vs горутина + канал](#206-future-vs-горутина--канал)
+- [20.7 В связке с другими паттернами](#207-в-связке-с-другими-паттернами)
+- [20.8 Практика Go: future с метриками](#208-практика-go-future-с-метриками)
+- [20.9 Выводы и типичные ошибки](#209-выводы-и-типичные-ошибки)
+- [20.10 Для быстрого повторения](#2010-для-быстрого-повторения)
+- [20.11 Вопросы для самопроверки](#2011-вопросы-для-самопроверки)
+- [20.12 Ответы](#2012-ответы)
+- [20.13 Куда идти дальше?](#2013-куда-идти-дальше)
+- [20.14 Чек-лист](#2014-чек-лист)
 
 ---
 
-## 20.0 Пролог: чат, который не масштабируется
+## 20.0 Пролог: параллельные запросы
 
-Ты пишешь чат на Go. HTTP-сервер, 1000 пользователей.
+У нас есть HTTP-хендлер, который формирует страницу пользователя. Для этого нужно:
+- Прочитать **профиль** из БД.
+- Прочитать **историю заказов** из БД.
+- Получить **рекомендации** из внешнего сервиса.
 
-**Наивная реализация:**
-
-```go
-func handler(w http.ResponseWriter, r *http.Request) {
-    for {
-        msg := getNewMessage()  // polling
-        json.NewEncoder(w).Encode(msg)
-        time.Sleep(100 * time.Millisecond)
-    }
-}
-```
-
-**Проблемы:**
-
-- **Polling каждые 100 мс** — 10 000 запросов/сек на 1000 пользователей.
-- **Latency до 100 мс.**
-- **Пустые ответы** — 99% запросов без данных.
-- **CPU и сеть** тратятся зря.
-
-❓ **Что произошло?** HTTP **request/response** не подходит для **real-time**. Нужен **push** от сервера.
-
-💡 **Решение:** **WebSocket**. Одно соединение, **полнодуплексный** канал, сервер **сам** отправляет сообщения.
+Пишем последовательно:
 
 ```go
 func handler(w http.ResponseWriter, r *http.Request) {
-    conn, _ := upgrader.Upgrade(w, r, nil)
-    defer conn.Close()
-
-    for msg := range messagesCh {
-        conn.WriteJSON(msg)  // push
-    }
+    profile := fetchProfile(r.Context(), userID)          // 50 мс
+    orders := fetchOrders(r.Context(), userID)            // 100 мс
+    recommendations := fetchRecommendations(r.Context())  // 200 мс
+    // ...
 }
 ```
 
-**Что изменилось:**
+Всё работает. Но 350 мс на запрос — долго. Три запроса **независимы** — их можно делать **параллельно**.
 
-- **Одно соединение** на пользователя.
-- **Push** от сервера.
-- **Latency ~1 мс.**
-- **Нет polling.**
+Хочется: запустить все три **одновременно**, подождать **все**, собрать результаты.
 
-**Это WebSocket.** В этой главе — WebSocket, SSE, gRPC streaming, hub-паттерн, backpressure, heartbeat, graceful shutdown.
+Можно через `WaitGroup` и общий слайс:
 
-> **Важный мост:** streaming — это **долгоживущие** соединения. Graceful shutdown (Глава 11) сложнее. Backpressure (Глава 8) критичен. Hub-паттерн — это **fan-in/fan-out** (Глава 8). Глава 27 (Distributed tracing) — для диагностики.
+```go
+var wg sync.WaitGroup
+var profile Profile
+var orders []Order
+var recommendations []Recommendation
+
+wg.Add(3)
+go func() { defer wg.Done(); profile = fetchProfile(ctx, userID) }()
+go func() { defer wg.Done(); orders = fetchOrders(ctx, userID) }()
+go func() { defer wg.Done(); recommendations = fetchRecommendations(ctx) }()
+wg.Wait()
+```
+
+Работает, но **неудобно**: три переменные, три горутины, `WaitGroup`. А если один запрос занимает 1 секунду, а другие 50 мс — ждём всё равно секунду.
+
+Хочется **абстракцию**: «запусти в фоне, дай мне ручку, я потом получу результат». Эта абстракция — **future**.
+
+> **Мост к следующим главам:** future — обобщение горутины + канал. Он часто используется для параллельных запросов, кэширования и pipeline. Понимание future даёт понимание, **как строить асинхронные API**.
 
 ---
 
-## 20.1 Почему HTTP не подходит для real-time
+## 20.1 Что такое future
 
-Прежде чем разбирать WebSocket, поймём **ограничения** HTTP.
+**Future** — объект, который представляет **результат**, который **ещё не готов**.
 
-### HTTP request/response
+### Идея
 
-**Модель:**
+- **Запускаем** операцию в фоне.
+- Получаем **future** — ручку для результата.
+- Позже **получаем** результат через future.
 
-1. Клиент отправляет запрос.
-2. Сервер обрабатывает.
-3. Сервер возвращает ответ.
-4. **Соединение закрывается** (или переиспользуется для нового запроса).
+```
+Запуск:
+  future := NewFuture(func() (T, error) { ... })
 
-**Ключевое:** **инициатива у клиента**. Сервер **не может** отправить данные без запроса.
+Позже:
+  result, err := future.Get(ctx)
+```
 
-### Проблемы для real-time
+### Когда использовать future
 
-**1. Polling.**
+**1. Параллельные запросы.**
 
-Клиент **периодически** спрашивает «есть новое?».
+- Профиль + заказы + рекомендации.
+- Запуск одновременно, получение позже.
 
-**Проблемы:**
+**2. Асинхронный API.**
 
-- **Latency:** до интервала polling.
-- **Пустые запросы:** 99% без данных.
-- **Нагрузка:** 10 000 запросов/сек.
+- Функция возвращает future.
+- Пользователь решает, когда ждать.
 
-**2. Long polling.**
+**3. Кэширование.**
 
-Клиент держит запрос **открытым**, пока сервер не ответит.
+- Future в кэше — избегает дублирования запросов.
 
-**Проблемы:**
+**4. Композиция.**
 
-- **Много соединений.**
-- **Сложнее реализация.**
-- **Timeout на прокси.**
+- Несколько future'ов → один.
 
-**3. HTTP/2 Server Push.**
+### Когда НЕ использовать future
 
-Сервер может **отправить** данные до запроса.
+**1. Синхронный код.**
 
-**Проблемы:**
+Если результат нужен сразу — future не нужен.
 
-- **Плохо поддерживается** браузерами.
-- **Не работает** для push после response.
+**2. Один вызов.**
 
-### Что нужно для real-time
+Для одного запроса — горутина + канал проще.
 
-**1. Push от сервера.**
+**3. Сложные зависимости.**
 
-Сервер **сам** отправляет данные, когда есть.
+Если результат нужен в разных местах с разной логикой — может быть сложнее.
 
-**2. Полнодуплексность.**
+### Ключевые свойства
 
-Клиент и сервер могут **одновременно** отправлять.
+**1. Однократное выполнение.**
 
-**3. Одно соединение.**
+Future запускает операцию **один раз**.
 
-Не открывать новое на каждый запрос.
+**2. Результат доступен после завершения.**
 
-**4. Низкая latency.**
+`Get` блокируется, пока результат не готов.
 
-~1 мс вместо 100 мс.
+**3. Результат можно получить несколько раз.**
 
-### Технологии
+Если future хранит результат — можно получать повторно.
 
-| Технология | Направление | Протокол | Браузеры |
-|:---|:---|:---|:---|
-| **Polling** | Client → Server | HTTP | ✅ |
-| **Long polling** | Client → Server | HTTP | ✅ |
-| **SSE** | Server → Client | HTTP | ✅ |
-| **WebSocket** | Bidirectional | WS | ✅ |
-| **gRPC streaming** | Bidirectional | HTTP/2 | ❌ (не в браузере) |
-
-### Выбор
-
-**1. Только сервер → клиент (уведомления, логи).**
-
-→ **SSE**.
-
-**2. Bidirectional (чат, игры).**
-
-→ **WebSocket**.
-
-**3. Микросервисы (gRPC).**
-
-→ **gRPC streaming**.
-
-### Аннотация сложности
-
-| Технология | Latency | Connections | Сложность |
-|:---|:---|:---|:---|
-| Polling | ~100 мс | N × частота | Низкая |
-| Long polling | ~1 мс | N | Средняя |
-| SSE | ~1 мс | N | Низкая |
-| WebSocket | ~1 мс | N | Средняя |
-| gRPC | ~1 мс | N | Средняя |
-
-### 💡 Практика: как выбрать технологию
+### 💡 Практика: как думать о future
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **SSE** — для сервер → клиент.
-2. **WebSocket** — для bidirectional.
-3. **gRPC streaming** — для микросервисов.
+1. **Future — для параллельных запросов.**
+2. **Future — для асинхронного API.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-4. **Fallback на polling** — если WebSocket не работает.
+3. **Future с `context` для отмены.**
+4. **Future в кэше** — избегает дублирования.
 
 **❌ НЕ ДЕЛАЙ:**
 
-5. **Не используй polling** для real-time.
-6. **Не используй WebSocket** для однонаправленной передачи.
-
-### Ключевые выводы подглавы 20.1
-
-- **HTTP request/response** — инициатива у клиента.
-- **Polling** — высокий latency, пустые запросы.
-- **Real-time** требует **push** от сервера.
-- **SSE** — сервер → клиент. **WebSocket** — bidirectional.
-- **gRPC streaming** — для микросервисов.
+5. **Не используй future для синхронного кода.**
+6. **Не забывай про утечки.**
 
 ---
 
-## 20.2 WebSocket: полнодуплексный канал
+## 20.2 Простейший future
 
-**WebSocket** — протокол для **bidirectional** связи.
+Начнём с самого простого — future на канале.
 
-### Как работает
+### Идея
 
-**Handshake:**
-
-1. Клиент отправляет **HTTP-запрос** с заголовками:
-   ```
-   Upgrade: websocket
-   Connection: Upgrade
-   Sec-WebSocket-Key: <random>
-   Sec-WebSocket-Version: 13
-   ```
-2. Сервер отвечает:
-   ```
-   HTTP/1.1 101 Switching Protocols
-   Upgrade: websocket
-   Connection: Upgrade
-   Sec-WebSocket-Accept: <hash>
-   ```
-3. **Соединение** становится WebSocket.
-
-**После handshake:**
-
-- **Frame-based** протокол.
-- **Bidirectional.**
-- **Низкая latency.**
-
-### Frame
-
-**WebSocket frame:**
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-------+-+-------------+-------------------------------+
-|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
-|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
-|N|V|V|V|       |S|             |   (if payload len==126/127)   |
-| |1|2|3|       |K|             |                               |
-+-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
-|     Extended payload length continued, if payload len == 127  |
-+ - - - - - - - - - - - - - - - +-------------------------------+
-|                               |Masking-key, if MASK set to 1  |
-+-------------------------------+-------------------------------+
-| Masking-key (continued)       |          Payload Data         |
-+-------------------------------- - - - - - - - - - - - - - - - +
-```
-
-**Что важно:**
-
-- **Opcode:** text (1), binary (2), close (8), ping (9), pong (10).
-- **Mask:** клиент → сервер — всегда маскируется.
-- **Payload len:** 7, 16, или 64 бита.
-
-### Ping/Pong
-
-**Ping** — сервер отправляет ping, клиент отвечает pong.
-
-**Зачем:**
-
-- **Проверка живости.**
-- **Обнаружение мёртвых соединений.**
-- **Heartbeat.**
-
-### Close
-
-**Close frame** — корректное закрытие.
-
-**Что делает:**
-
-- Отправляет close code.
-- Ждёт ответа.
-- Закрывает соединение.
-
-**Close codes:**
-
-- **1000** — normal.
-- **1001** — going away.
-- **1002** — protocol error.
-- **1008** — policy violation.
-- **1009** — message too big.
-- **1011** — internal error.
-
-### Go-библиотеки
-
-**1. `github.com/gorilla/websocket`** — старая, но проверенная.
-
-**2. `nhooyr.io/websocket`** (теперь `github.com/coder/websocket`) — современная, context-aware.
-
-**3. `golang.org/x/net/websocket`** — устаревшая, не рекомендуется.
-
-### Пример на `gorilla/websocket`
-
-```go
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-    conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        log.Println(err)
-        return
-    }
-    defer conn.Close()
-
-    for {
-        mt, msg, err := conn.ReadMessage()
-        if err != nil {
-            break
-        }
-        if err := conn.WriteMessage(mt, msg); err != nil {
-            break
-        }
-    }
-}
-```
-
-### Пример на `nhooyr/websocket`
-
-```go
-func handler(w http.ResponseWriter, r *http.Request) {
-    conn, err := websocket.Accept(w, r, nil)
-    if err != nil {
-        log.Println(err)
-        return
-    }
-    defer conn.Close(websocket.StatusInternalError, "closing")
-
-    ctx := r.Context()
-    for {
-        mt, msg, err := conn.Read(ctx)
-        if err != nil {
-            break
-        }
-        if err := conn.Write(ctx, mt, msg); err != nil {
-            break
-        }
-    }
-}
-```
-
-**Ключевое:** `nhooyr` использует `context.Context`.
-
-### Сравнение
-
-| Аспект | gorilla | nhooyr/coder |
-|:---|:---|:---|
-| Context | ❌ | ✅ |
-| Зрелость | ✅ | ✅ |
-| Поддержка | Ограниченная | Активная |
-| API | Классический | Современный |
-
-**Рекомендация:** `nhooyr/coder/websocket` для новых проектов.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| Handshake | ~1-10 мс |
-| `Read` frame | ~10-50 мкс |
-| `Write` frame | ~10-50 мкс |
-| Ping | ~1-5 мс |
-
-### 💡 Практика: как использовать WebSocket
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`nhooyr/coder/websocket`** — для новых проектов.
-2. **Ping/pong** для heartbeat.
-3. **Close codes** для корректного закрытия.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **`context.Context`** для отмены.
-5. **Ограничение размера** сообщений.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не используй `golang.org/x/net/websocket`.**
-7. **Не игнорируй ping/pong.**
-
-### Ключевые выводы подглавы 20.2
-
-- **WebSocket** — bidirectional.
-- **Handshake** через HTTP Upgrade.
-- **Frame-based** протокол.
-- **Ping/pong** для heartbeat.
-- **`nhooyr/coder`** — рекомендуется.
-
----
-
-## 20.3 WebSocket-сервер: hub-паттерн
-
-Разберём **hub-паттерн** для WebSocket.
-
-### Проблема
-
-**1000 клиентов** подключены. Сообщение от одного — всем.
-
-**Наивно:**
-
-```go
-var conns []*websocket.Conn
-var mu sync.Mutex
-
-func broadcast(msg []byte) {
-    mu.Lock()
-    defer mu.Unlock()
-    for _, conn := range conns {
-        conn.WriteMessage(websocket.TextMessage, msg)
-    }
-}
-```
-
-**Проблемы:**
-
-- **Mutex на все операции.**
-- **Медленный клиент** блокирует всех.
-- **Нет backpressure.**
-
-### Решение: hub
-
-**Hub** — центральная горутина, которая управляет клиентами.
-
-**Идея:**
-
-- **Регистрация** через канал.
-- **Отправка** через канал.
-- **Broadcast** через каналы.
-
-### Структура
-
-```go
-type Hub struct {
-    clients    map[*Client]bool
-    broadcast  chan []byte
-    register   chan *Client
-    unregister chan *Client
-}
-
-type Client struct {
-    hub  *Hub
-    conn *websocket.Conn
-    send chan []byte
-}
-```
-
-### Run
-
-```go
-func (h *Hub) Run(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case client := <-h.register:
-            h.clients[client] = true
-        case client := <-h.unregister:
-            if _, ok := h.clients[client]; ok {
-                delete(h.clients, client)
-                close(client.send)
-            }
-        case message := <-h.broadcast:
-            for client := range h.clients {
-                select {
-                case client.send <- message:
-                default:
-                    // Клиент не успевает — отключаем
-                    close(client.send)
-                    delete(h.clients, client)
-                }
-            }
-        }
-    }
-}
-```
-
-**Что делает:**
-
-1. **Register** — добавляет клиента.
-2. **Unregister** — удаляет.
-3. **Broadcast** — рассылает всем.
-4. **Non-blocking send** — если клиент не успевает, отключаем.
-
-### Client
-
-```go
-func (c *Client) readPump(ctx context.Context) {
-    defer func() {
-        c.hub.unregister <- c
-        c.conn.Close()
-    }()
-
-    c.conn.SetReadLimit(512)
-    c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-    c.conn.SetPongHandler(func(string) error {
-        c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-        return nil
-    })
-
-    for {
-        _, message, err := c.conn.ReadMessage()
-        if err != nil {
-            break
-        }
-        c.hub.broadcast <- message
-    }
-}
-
-func (c *Client) writePump(ctx context.Context) {
-    ticker := time.NewTicker(54 * time.Second)
-    defer func() {
-        ticker.Stop()
-        c.conn.Close()
-    }()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case message, ok := <-c.send:
-            if !ok {
-                c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-                return
-            }
-            c.conn.WriteMessage(websocket.TextMessage, message)
-        case <-ticker.C:
-            c.conn.WriteMessage(websocket.PingMessage, nil)
-        }
-    }
-}
-```
-
-**Что делает:**
-
-- **readPump** — читает от клиента, отправляет в broadcast.
-- **writePump** — пишет клиенту, отправляет ping.
-
-### Схема
-
-```
-                  ┌──────────────┐
-                  │     Hub      │
-                  │              │
-                  │  broadcast   │
-                  │  register    │
-                  │  unregister  │
-                  └──────┬───────┘
-                         │
-       ┌─────────────────┼─────────────────┐
-       │                 │                 │
-       ▼                 ▼                 ▼
-  ┌─────────┐       ┌─────────┐       ┌─────────┐
-  │ Client1 │       │ Client2 │       │ Client3 │
-  │  send   │       │  send   │       │  send   │
-  │  conn   │       │  conn   │       │  conn   │
-  └─────────┘       └─────────┘       └─────────┘
-```
-
-### Ключевое
-
-**1. Hub — одна горутина.**
-
-Все операции с map — **без блокировок**.
-
-**2. Client — две горутины.**
-
-- **readPump** — читает.
-- **writePump** — пишет.
-
-**3. Backpressure через `send`.**
-
-Если `send` полон — клиент отключается.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| Register | ~100-200 нс |
-| Broadcast | ~100-200 нс × N |
-| Send | ~100-200 нс |
-
-### 💡 Практика: как строить hub
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Hub — одна горутина.**
-2. **Client — readPump + writePump.**
-3. **Non-blocking send** для broadcast.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Ping/pong** для heartbeat.
-5. **Read limit** для защиты.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не используй Mutex** для клиентов.
-7. **Не блокируйся** на медленном клиенте.
-
-### Ключевые выводы подглавы 20.3
-
-- **Hub** — центральная горутина.
-- **Client** — readPump + writePump.
-- **Non-blocking send** — backpressure.
-- **Без Mutex.**
-
----
-
-## 20.4 Server-Sent Events: односторонний поток
-
-**SSE (Server-Sent Events)** — push от сервера **только**.
-
-### Что это
-
-**SSE** — HTTP-ответ, который **не закрывается**.
-
-**Формат:**
-
-```
-event: message
-data: {"text": "hello"}
-
-event: message
-data: {"text": "world"}
-
-```
-
-**Что важно:**
-
-- **`Content-Type: text/event-stream`**
-- **`Cache-Control: no-cache`**
-- **`Connection: keep-alive`**
-
-### Когда использовать
-
-**SSE подходит:**
-
-- **Уведомления.**
-- **Логи в реальном времени.**
-- **Метрики.**
-- **Обновления цен.**
-
-**SSE не подходит:**
-
-- **Bidirectional** (чат, игры) — используй WebSocket.
+- Future содержит канал для результата.
+- Горутина пишет результат в канал.
+- `Get` читает из канала.
 
 ### Реализация
 
 ```go
-func sseHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "text/event-stream")
-    w.Header().Set("Cache-Control", "no-cache")
-    w.Header().Set("Connection", "keep-alive")
+type Future[T any] struct {
+    result chan T
+    err    chan error
+}
 
-    flusher, ok := w.(http.Flusher)
-    if !ok {
-        http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-        return
+func NewFuture[T any](fn func() (T, error)) *Future[T] {
+    f := &Future[T]{
+        result: make(chan T, 1),
+        err:    make(chan error, 1),
     }
-
-    ch := subscribe()
-    defer unsubscribe(ch)
-
-    for {
-        select {
-        case <-r.Context().Done():
-            return
-        case msg := <-ch:
-            fmt.Fprintf(w, "data: %s\n\n", msg)
-            flusher.Flush()
-        }
-    }
-}
-```
-
-**Что делает:**
-
-1. Устанавливает заголовки.
-2. **Flush** после каждого сообщения.
-3. Читает из канала.
-4. Отправляет в SSE-формате.
-
-### Формат SSE
-
-```
-data: простая строка
-
-event: custom
-data: строка с типом
-
-id: 42
-data: строка с id
-
-: комментарий (игнорируется)
-
-data: многострочное
-data: сообщение
-
-```
-
-**Поля:**
-
-- **`data`** — данные.
-- **`event`** — тип события.
-- **`id`** — ID (для reconnect).
-- **`retry`** — время reconnect.
-
-### Reconnect
-
-**Браузер** автоматически переподключается.
-
-**`Last-Event-ID`** — браузер отправляет последний ID.
-
-**Сервер** может **продолжить** с этого ID.
-
-### WebSocket vs SSE
-
-| Аспект | WebSocket | SSE |
-|:---|:---|:---|
-| Направление | Bidirectional | Server → Client |
-| Протокол | WS | HTTP |
-| Binary | ✅ | ❌ |
-| Reconnect | Ручной | Авто |
-| Proxy | Сложнее | Проще |
-| Браузеры | ✅ | ✅ |
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| Открытие | ~1-10 мс |
-| Отправка | ~10-50 мкс |
-| Reconnect | Авто |
-
-### 💡 Практика: как использовать SSE
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`Content-Type: text/event-stream`.**
-2. **`Flush`** после каждого сообщения.
-3. **`context.Context`** для отмены.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **`id`** для reconnect.
-5. **Heartbeat** через комментарии.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не используй SSE** для bidirectional.
-7. **Не забывай flush.**
-
-### Ключевые выводы подглавы 20.4
-
-- **SSE** — push от сервера.
-- **`text/event-stream`.**
-- **`Flush`** обязателен.
-- **Auto-reconnect** в браузере.
-- **Не для bidirectional.**
-
----
-
-## 20.5 gRPC bidirectional streaming
-
-**gRPC streaming** — для микросервисов.
-
-### Три типа streaming
-
-**1. Server streaming.**
-
-Клиент отправляет запрос, сервер отвечает **потоком**.
-
-```proto
-rpc ServerStream(Request) returns (stream Response);
-```
-
-**2. Client streaming.**
-
-Клиент отправляет **поток**, сервер отвечает **один раз**.
-
-```proto
-rpc ClientStream(stream Request) returns (Response);
-```
-
-**3. Bidirectional streaming.**
-
-Оба отправляют **потоки**.
-
-```proto
-rpc Bidirectional(stream Request) returns (stream Response);
-```
-
-### Пример bidirectional
-
-**Proto:**
-
-```proto
-syntax = "proto3";
-
-service Chat {
-    rpc Chat(stream Message) returns (stream Message);
-}
-
-message Message {
-    string user = 1;
-    string text = 2;
-}
-```
-
-**Сервер:**
-
-```go
-func (s *Server) Chat(stream pb.Chat_ChatServer) error {
-    for {
-        msg, err := stream.Recv()
-        if err == io.EOF {
-            return nil
-        }
-        if err != nil {
-            return err
-        }
-
-        // Обработка
-        response := &pb.Message{
-            User: "server",
-            Text: "echo: " + msg.Text,
-        }
-
-        if err := stream.Send(response); err != nil {
-            return err
-        }
-    }
-}
-```
-
-**Клиент:**
-
-```go
-stream, err := client.Chat(ctx)
-if err != nil {
-    return err
-}
-
-// Отправка
-go func() {
-    for _, msg := range messages {
-        if err := stream.Send(msg); err != nil {
-            return
-        }
-    }
-    stream.CloseSend()
-}()
-
-// Получение
-for {
-    resp, err := stream.Recv()
-    if err == io.EOF {
-        break
-    }
-    if err != nil {
-        return err
-    }
-    fmt.Println(resp.Text)
-}
-```
-
-### Ключевое
-
-**1. `Recv` и `Send` — блокирующие.**
-
-**2. `io.EOF` — поток закрыт.**
-
-**3. `context.Context` — отмена.**
-
-**4. Потоки мультиплексируются** на одном HTTP/2.
-
-### HTTP/2
-
-**gRPC работает поверх HTTP/2.**
-
-**Что даёт:**
-
-- **Multiplexing** — несколько потоков на одном соединении.
-- **Bidirectional** — в одном соединении.
-- **Compression** — заголовки.
-
-### Backpressure
-
-**gRPC** имеет **встроенный** flow control через HTTP/2.
-
-**Что делает:**
-
-- **Окно** на приём.
-- **Приостановка** отправки, если получатель не успевает.
-
-**Но:** нужно обрабатывать `Recv`/`Send` асинхронно.
-
-### Пример с backpressure
-
-```go
-func (s *Server) Chat(stream pb.Chat_ChatServer) error {
-    for {
-        msg, err := stream.Recv()
-        if err != nil {
-            return err
-        }
-
-        // Обработка может быть медленной
-        // Backpressure через flow control HTTP/2
-        select {
-        case <-stream.Context().Done():
-            return stream.Context().Err()
-        default:
-        }
-
-        if err := stream.Send(msg); err != nil {
-            return err
-        }
-    }
-}
-```
-
-### Ошибки
-
-**`codes.Unavailable`** — сервис недоступен.
-
-**`codes.DeadlineExceeded`** — таймаут.
-
-**`codes.Canceled`** — отмена.
-
-**`codes.ResourceExhausted`** — перегрузка.
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `Recv` | ~10-50 мкс |
-| `Send` | ~10-50 мкс |
-| Установка потока | ~1-10 мс |
-
-### 💡 Практика: как использовать gRPC streaming
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **`context.Context`** для отмены.
-2. **Обрабатывай `io.EOF`** — поток закрыт.
-3. **Flow control** HTTP/2.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Асинхронный `Recv`/`Send`** — если нужно.
-5. **Метрики** — latency, throughput.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не блокируйся** на `Recv`/`Send` без отмены.
-7. **Не игнорируй коды ошибок.**
-
-### Ключевые выводы подглавы 20.5
-
-- **gRPC streaming** — 3 типа.
-- **Bidirectional** — оба потока.
-- **HTTP/2** — multiplexing.
-- **Flow control** — встроенный backpressure.
-- **`context.Context`** — отмена.
-
----
-
-## 20.6 Backpressure в streaming
-
-Разберём **backpressure** в streaming.
-
-### Проблема
-
-**Быстрый producer**, медленный consumer.
-
-```
-Producer ────▶ [канал] ────▶ Consumer
-             рост          медленно
-```
-
-**Что происходит:** буфер растёт, память растёт, OOM.
-
-### В WebSocket
-
-**Проблема:** `conn.WriteMessage` **блокирует**, если клиент медленный.
-
-**Решение:** **буферизованный `send` + non-blocking**.
-
-```go
-type Client struct {
-    send chan []byte  // буфер
-}
-
-func (h *Hub) broadcast(message []byte) {
-    for client := range h.clients {
-        select {
-        case client.send <- message:
-            // OK
-        default:
-            // Буфер полон — клиент не успевает
-            close(client.send)
-            delete(h.clients, client)
-        }
-    }
-}
-```
-
-**Что делает:**
-
-- **Non-blocking send** в `send`.
-- Если буфер полон — клиент **отключается**.
-
-**Размер буфера:**
-
-- **256-1024** сообщений.
-- Больше — память.
-- Меньше — отключаем часто.
-
-### В SSE
-
-**Проблема:** `fmt.Fprintf` + `Flush` **блокирует**.
-
-**Решение:** **буферизованный канал** + **drop**.
-
-```go
-func sseHandler(w http.ResponseWriter, r *http.Request) {
-    ch := make(chan string, 256)
-
+    
     go func() {
-        for msg := range ch {
-            fmt.Fprintf(w, "data: %s\n\n", msg)
-            flusher.Flush()
+        defer close(f.result)
+        defer close(f.err)
+        
+        r, e := fn()
+        if e != nil {
+            f.err <- e
+            return
         }
+        f.result <- r
     }()
-
-    for {
-        select {
-        case msg := <-ch:
-            // ...
-        default:
-            // Буфер полон — drop
-        }
-    }
-}
-```
-
-### В gRPC
-
-**gRPC** имеет **встроенный** flow control HTTP/2.
-
-**Что делает:**
-
-- **Окно** на приём.
-- **Приостановка** отправки.
-- **Автоматически.**
-
-**Что нужно:** обрабатывать `Recv`/`Send` **асинхронно**.
-
-### Паттерн: bounded queue
-
-**Идея:** ограниченная очередь + стратегия.
-
-**Стратегии:**
-
-**1. Drop oldest.**
-
-```go
-select {
-case ch <- msg:
-default:
-    <-ch  // удалить старый
-    ch <- msg
-}
-```
-
-**2. Drop newest.**
-
-```go
-select {
-case ch <- msg:
-default:
-    // drop
-}
-```
-
-**3. Block.**
-
-```go
-select {
-case ch <- msg:
-case <-ctx.Done():
-    return
-}
-```
-
-**4. Disconnect.**
-
-```go
-select {
-case ch <- msg:
-default:
-    close(ch)  // отключить клиента
-}
-```
-
-### Выбор стратегии
-
-| Стратегия | Когда |
-|:---|:---|
-| Drop oldest | Логи, метрики |
-| Drop newest | Уведомления |
-| Block | Критичные данные |
-| Disconnect | Медленный клиент |
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| `select` + `default` | ~1-5 нс |
-| Blocking send | ~50-100 нс |
-| Drop | ~1-5 нс |
-
-### 💡 Практика: как обрабатывать backpressure
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Буферизованный `send`.**
-2. **Non-blocking send.**
-3. **Стратегия** — drop или disconnect.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Метрики** — сколько drop.
-5. **Размер буфера** — 256-1024.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не блокируйся** на медленном клиенте.
-7. **Не делай буфер безграничным.**
-
-### Ключевые выводы подглавы 20.6
-
-- **Backpressure** — критичен для streaming.
-- **Буферизованный `send`** + **non-blocking**.
-- **Стратегии:** drop oldest, drop newest, block, disconnect.
-- **gRPC** — встроенный flow control.
-- **Метрики** — сколько drop.
-
----
-
-## 20.7 Heartbeat и reconnect
-
-Разберём **heartbeat** и **reconnect**.
-
-### Heartbeat
-
-**Heartbeat** — периодические сообщения для проверки живости.
-
-**Зачем:**
-
-- **Обнаружить мёртвые соединения.**
-- **Держать NAT/proxy открытыми.**
-- **Обновлять таймауты.**
-
-### Ping/pong в WebSocket
-
-```go
-func (c *Client) writePump() {
-    ticker := time.NewTicker(54 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            c.conn.WriteMessage(websocket.PingMessage, nil)
-        case message := <-c.send:
-            c.conn.WriteMessage(websocket.TextMessage, message)
-        }
-    }
+    
+    return f
 }
 
-func (c *Client) readPump() {
-    c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-    c.conn.SetPongHandler(func(string) error {
-        c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-        return nil
-    })
-
-    for {
-        _, message, err := c.conn.ReadMessage()
-        if err != nil {
-            break
-        }
-        // ...
-    }
-}
-```
-
-**Что делает:**
-
-- **Ping каждые 54 сек.**
-- **Read deadline 60 сек.**
-- **Pong обновляет deadline.**
-
-**Таймауты:**
-
-- **Ping interval < Pong timeout.**
-- **Read deadline > Ping interval.**
-
-**Рекомендация:**
-
-- **Ping: 30-60 сек.**
-- **Read deadline: 60-120 сек.**
-
-### Heartbeat в SSE
-
-**SSE** не имеет ping/pong.
-
-**Решение:** **комментарии**.
-
-```go
-ticker := time.NewTicker(30 * time.Second)
-defer ticker.Stop()
-
-for {
-    select {
-    case <-ticker.C:
-        fmt.Fprintf(w, ": heartbeat\n\n")
-        flusher.Flush()
-    case msg := <-ch:
-        fmt.Fprintf(w, "data: %s\n\n", msg)
-        flusher.Flush()
-    }
-}
-```
-
-**Что делает:** отправляет комментарий каждые 30 сек.
-
-### Reconnect
-
-**WebSocket:** reconnect **ручной**.
-
-**Клиент:**
-
-```go
-func connect(url string) {
-    for {
-        conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-        if err != nil {
-            time.Sleep(1 * time.Second)
-            continue
-        }
-
-        err = handle(conn)
-        conn.Close()
-
-        time.Sleep(1 * time.Second)
-    }
-}
-```
-
-**Что делает:**
-
-- **Пытается подключиться.**
-- **Обрабатывает.**
-- **При ошибке — retry.**
-
-**Backoff:**
-
-- **Exponential** для reconnect.
-- **Jitter.**
-
-### SSE reconnect
-
-**Браузер** автоматически переподключается.
-
-**Что делает:**
-
-1. Соединение закрылось.
-2. Ждёт `retry` (по умолчанию 3 сек).
-3. Переподключается с `Last-Event-ID`.
-
-**Сервер:**
-
-```go
-lastID := r.Header.Get("Last-Event-ID")
-// Продолжить с lastID
-```
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| Ping | ~1-5 мс |
-| Read deadline | ~1-5 мс |
-| Reconnect | ~1-10 сек |
-
-### 💡 Практика: как использовать heartbeat
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Ping/pong** для WebSocket.
-2. **Комментарии** для SSE.
-3. **Read deadline** для обнаружения мёртвых.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Reconnect с backoff** на клиенте.
-5. **`Last-Event-ID`** для SSE.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не игнорируй heartbeat.**
-7. **Не делай reconnect без backoff.**
-
-### Ключевые выводы подглавы 20.7
-
-- **Heartbeat** — для проверки живости.
-- **Ping/pong** в WebSocket.
-- **Комментарии** в SSE.
-- **Reconnect** — ручной (WS) или авто (SSE).
-- **Backoff** для reconnect.
-
----
-
-## 20.8 Graceful shutdown для streaming
-
-Разберём **graceful shutdown** для streaming.
-
-### Проблема
-
-**Streaming-соединения долгоживущие.** `srv.Shutdown` **ждёт** их завершения. Но они **не завершаются** сами.
-
-### Что нужно
-
-1. **Прекратить принимать** новые соединения.
-2. **Отправить close** активным.
-3. **Дождаться** завершения.
-4. **Таймаут** для защиты.
-
-### WebSocket
-
-```go
-func (c *Client) close() {
-    c.conn.WriteControl(
-        websocket.CloseMessage,
-        websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"),
-        time.Now().Add(5*time.Second),
-    )
-    c.conn.Close()
-}
-```
-
-**Что делает:**
-
-- Отправляет close frame.
-- Ждёт 5 сек.
-- Закрывает.
-
-### Hub shutdown
-
-```go
-func (h *Hub) Shutdown(ctx context.Context) {
-    // Отправить close всем клиентам
-    for client := range h.clients {
-        client.close()
-    }
-
-    // Ждать завершения
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    
     select {
     case <-ctx.Done():
-        log.Println("shutdown timeout")
-    default:
-        // Ждём немного
-        time.Sleep(100 * time.Millisecond)
+        return zero, ctx.Err()
+    case err := <-f.err:
+        return zero, err
+    case r := <-f.result:
+        return r, nil
     }
 }
-```
-
-### srv.Shutdown
-
-**С `srv.Shutdown`:**
-
-```go
-ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-defer stop()
-
-srv := &http.Server{Addr: ":8080", Handler: mux}
-go srv.ListenAndServe()
-
-<-ctx.Done()
-
-// 1. Закрыть все WebSocket
-hub.Shutdown(context.Background())
-
-// 2. Shutdown HTTP
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-srv.Shutdown(shutdownCtx)
-```
-
-**Важно:** сначала закрыть streaming, потом HTTP.
-
-### gRPC
-
-**gRPC** имеет `GracefulStop`:
-
-```go
-grpcServer.GracefulStop()  // ждёт завершения
-```
-
-**С таймаутом:**
-
-```go
-done := make(chan struct{})
-go func() {
-    grpcServer.GracefulStop()
-    close(done)
-}()
-
-select {
-case <-done:
-    log.Println("graceful shutdown complete")
-case <-time.After(5 * time.Second):
-    grpcServer.Stop()  // force
-}
-```
-
-### SSE
-
-**SSE:** `r.Context()` отменяется при `srv.Shutdown`. Обработчик **завершается**.
-
-```go
-for {
-    select {
-    case <-r.Context().Done():
-        return  // shutdown
-    case msg := <-ch:
-        // ...
-    }
-}
-```
-
-### Аннотация сложности
-
-| Операция | Time |
-|:---|:---|
-| Close frame | ~1-5 мс |
-| Shutdown | 0-30 сек |
-| Force | ~1-10 мс |
-
-### 💡 Практика: как делать graceful shutdown для streaming
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Close frame** для WebSocket.
-2. **`r.Context()`** для SSE.
-3. **`GracefulStop`** для gRPC.
-4. **Таймаут** для защиты.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-5. **Сначала streaming, потом HTTP.**
-6. **Логирование** shutdown.
-
-**❌ НЕ ДЕЛАЙ:**
-
-7. **Не жди вечно.**
-8. **Не забывай close frame.**
-
-### Ключевые выводы подглавы 20.8
-
-- **Streaming-соединения** долгоживущие.
-- **Close frame** для WebSocket.
-- **`r.Context()`** для SSE.
-- **`GracefulStop`** для gRPC.
-- **Таймаут** обязателен.
-
----
-
-## 20.9 Масштабирование streaming
-
-Разберём **масштабирование** streaming.
-
-### Проблема
-
-**Один сервер** не выдержит 100 000 соединений.
-
-**Решение:** **несколько серверов**.
-
-**Но:** как отправить сообщение клиенту на **другом** сервере?
-
-### Решение: pub/sub
-
-**Идея:** использовать **Redis Pub/Sub** или **NATS** для broadcast между серверами.
-
-**Схема:**
-
-```
-  Server 1                    Server 2
-  ┌────────┐                  ┌────────┐
-  │ Hub 1  │                  │ Hub 2  │
-  └───┬────┘                  └───┬────┘
-      │                           │
-      └───────────┬───────────────┘
-                  │
-          ┌───────▼────────┐
-          │  Redis Pub/Sub │
-          └────────────────┘
 ```
 
 **Что происходит:**
 
-- Server 1 отправляет сообщение в **Redis Pub/Sub**.
-- Server 2 **подписан** — получает сообщение.
-- Server 2 отправляет клиенту.
+1. `NewFuture` создаёт два канала — для результата и ошибки.
+2. Запускает горутину, которая вызывает `fn`.
+3. Результат или ошибка пишется в соответствующий канал.
+4. `Get` ждёт результат, ошибку или отмену `ctx`.
 
-### Реализация
+### Потребитель
 
 ```go
-type Hub struct {
-    clients    map[*Client]bool
-    broadcast  chan []byte
-    register   chan *Client
-    unregister chan *Client
-    pubsub     *redis.PubSub
-}
-
-func (h *Hub) Run(ctx context.Context) {
-    // Подписка
-    ch := h.pubsub.Channel()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case client := <-h.register:
-            h.clients[client] = true
-        case client := <-h.unregister:
-            if _, ok := h.clients[client]; ok {
-                delete(h.clients, client)
-                close(client.send)
-            }
-        case message := <-h.broadcast:
-            // Publish в Redis
-            h.redis.Publish(ctx, "chat", message)
-        case msg := <-ch:
-            // Сообщение из Redis — отправить локальным клиентам
-            for client := range h.clients {
-                select {
-                case client.send <- []byte(msg.Payload):
-                default:
-                    close(client.send)
-                    delete(h.clients, client)
-                }
-            }
-        }
-    }
+func main() {
+    future := NewFuture(func() (string, error) {
+        time.Sleep(1 * time.Second)
+        return "result", nil
+    })
+    
+    // Делаем что-то другое
+    fmt.Println("doing other work...")
+    time.Sleep(500 * time.Millisecond)
+    
+    // Получаем результат
+    result, err := future.Get(context.Background())
+    fmt.Printf("result: %s, err: %v\n", result, err)
 }
 ```
 
-### Sticky sessions
+**Пример вывода:**
 
-**Проблема:** клиент должен попасть на **тот же** сервер.
-
-**Решение:** **sticky sessions** в load balancer.
-
-**Или:** **stateless** через pub/sub.
-
-### NATS
-
-**NATS** — альтернатива Redis.
-
-**Плюсы:**
-
-- **Быстрее.**
-- **Проще.**
-- **Встроенный clustering.**
-
-**Использование:**
-
-```go
-nc, _ := nats.Connect(nats.DefaultURL)
-defer nc.Close()
-
-// Публикация
-nc.Publish("chat", []byte("hello"))
-
-// Подписка
-nc.Subscribe("chat", func(m *nats.Msg) {
-    // ...
-})
+```
+doing other work...
+result: result, err: <nil>
 ```
 
-### Kubernetes
+**Что видно:** future запускается сразу. Пока мы делаем другую работу — операция выполняется. Через 500 мс получаем результат (ещё через 500 мс).
 
-**Проблема:** Pods могут меняться.
+### Буферизованные каналы
 
-**Решение:**
+**Почему `make(chan T, 1)`?**
 
-- **Service** для стабильного адреса.
-- **Sticky sessions** на Ingress.
-- **Pub/sub** для координации.
+- Буфер на 1 позволяет горутине **записать результат** и **завершиться**, даже если никто не читал.
+- Без буфера — горутина зависнет на `f.result <- r`, если `Get` не вызывается.
 
-### Аннотация сложности
-
-| Операция | Redis | NATS |
-|:---|:---|:---|
-| Publish | ~1-5 мс | ~100-500 мкс |
-| Subscribe | ~1-5 мс | ~100-500 мкс |
-
-### 💡 Практика: как масштабировать streaming
-
-**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
-
-1. **Pub/sub** (Redis, NATS) для broadcast.
-2. **Sticky sessions** или stateless.
-3. **Kubernetes** для оркестрации.
-
-**👍 СТОИТ СДЕЛАТЬ:**
-
-4. **Метрики** — количество соединений.
-5. **Алерты** на аномалии.
-
-**❌ НЕ ДЕЛАЙ:**
-
-6. **Не делай stateful** без необходимости.
-7. **Не игнорируй pub/sub задержку.**
-
-### Ключевые выводы подглавы 20.9
-
-- **Масштабирование** через pub/sub.
-- **Redis Pub/Sub** или **NATS**.
-- **Sticky sessions** или stateless.
-- **Kubernetes** для оркестрации.
-
----
-
-## 20.10 Практика Go: WebSocket-чат с hub
-
-Напишем **полный WebSocket-чат** с hub.
-
-### Код
+### Полный код
 
 ```go
 package main
 
 import (
     "context"
-    "encoding/json"
-    "log"
-    "net/http"
-    "os/signal"
-    "sync"
-    "syscall"
+    "fmt"
     "time"
-
-    "github.com/gorilla/websocket"
 )
 
-type Message struct {
-    User string `json:"user"`
-    Text string `json:"text"`
+type Future[T any] struct {
+    result chan T
+    err    chan error
 }
 
-type Hub struct {
-    clients    map[*Client]bool
-    broadcast  chan []byte
-    register   chan *Client
-    unregister chan *Client
-}
-
-func NewHub() *Hub {
-    return &Hub{
-        clients:    make(map[*Client]bool),
-        broadcast:  make(chan []byte, 256),
-        register:   make(chan *Client),
-        unregister: make(chan *Client),
+func NewFuture[T any](fn func() (T, error)) *Future[T] {
+    f := &Future[T]{
+        result: make(chan T, 1),
+        err:    make(chan error, 1),
     }
-}
-
-func (h *Hub) Run(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
+    
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        
+        r, e := fn()
+        if e != nil {
+            f.err <- e
             return
-        case client := <-h.register:
-            h.clients[client] = true
-            log.Printf("client connected, total: %d", len(h.clients))
-        case client := <-h.unregister:
-            if _, ok := h.clients[client]; ok {
-                delete(h.clients, client)
-                close(client.send)
-                log.Printf("client disconnected, total: %d", len(h.clients))
-            }
-        case message := <-h.broadcast:
-            for client := range h.clients {
-                select {
-                case client.send <- message:
-                default:
-                    close(client.send)
-                    delete(h.clients, client)
-                }
-            }
         }
-    }
-}
-
-func (h *Hub) Shutdown() {
-    for client := range h.clients {
-        client.close()
-    }
-}
-
-type Client struct {
-    hub  *Hub
-    conn *websocket.Conn
-    send chan []byte
-}
-
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
-    conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        log.Println(err)
-        return
-    }
-
-    client := &Client{
-        hub:  h,
-        conn: conn,
-        send: make(chan []byte, 256),
-    }
-
-    client.hub.register <- client
-
-    go client.writePump(r.Context())
-    go client.readPump(r.Context())
-}
-
-func (c *Client) readPump(ctx context.Context) {
-    defer func() {
-        c.hub.unregister <- c
-        c.conn.Close()
+        f.result <- r
     }()
-
-    c.conn.SetReadLimit(512)
-    c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-    c.conn.SetPongHandler(func(string) error {
-        c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-        return nil
-    })
-
-    for {
-        _, message, err := c.conn.ReadMessage()
-        if err != nil {
-            if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
-                log.Printf("error: %v", err)
-            }
-            return
-        }
-        c.hub.broadcast <- message
-    }
+    
+    return f
 }
 
-func (c *Client) writePump(ctx context.Context) {
-    ticker := time.NewTicker(54 * time.Second)
-    defer func() {
-        ticker.Stop()
-        c.conn.Close()
-    }()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case message, ok := <-c.send:
-            if !ok {
-                c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-                return
-            }
-            c.conn.WriteMessage(websocket.TextMessage, message)
-        case <-ticker.C:
-            c.conn.WriteMessage(websocket.PingMessage, nil)
-        }
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    
+    select {
+    case <-ctx.Done():
+        return zero, ctx.Err()
+    case err := <-f.err:
+        return zero, err
+    case r := <-f.result:
+        return r, nil
     }
-}
-
-func (c *Client) close() {
-    c.conn.WriteControl(
-        websocket.CloseMessage,
-        websocket.FormatCloseMessage(websocket.CloseGoingAway, "shutdown"),
-        time.Now().Add(5*time.Second),
-    )
-    c.conn.Close()
 }
 
 func main() {
-    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-    defer stop()
-
-    hub := NewHub()
-    go hub.Run(ctx)
-
-    http.HandleFunc("/ws", hub.HandleWS)
-
-    srv := &http.Server{Addr: ":8080"}
-    go func() {
-        log.Println("server starting on :8080")
-        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatal(err)
-        }
-    }()
-
-    <-ctx.Done()
-    log.Println("shutting down...")
-
-    // 1. Закрыть WebSocket
-    hub.Shutdown()
-
-    // 2. Shutdown HTTP
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    srv.Shutdown(shutdownCtx)
-
-    log.Println("done")
+    future := NewFuture(func() (string, error) {
+        time.Sleep(1 * time.Second)
+        return "result", nil
+    })
+    
+    fmt.Println("doing other work...")
+    time.Sleep(500 * time.Millisecond)
+    
+    result, err := future.Get(context.Background())
+    fmt.Printf("result: %s, err: %v\n", result, err)
 }
 ```
 
-### Что демонстрирует
+### Схема
 
-1. **Hub** — центральная горутина.
-2. **Client** — readPump + writePump.
-3. **Backpressure** — non-blocking send.
-4. **Ping/pong** — heartbeat.
-5. **Graceful shutdown** — close + shutdown.
+```
+NewFuture(fn):
+  ├── result := make(chan T, 1)
+  ├── err := make(chan error, 1)
+  └── go fn()
+        ├── r, e := fn()
+        ├── if e != nil: err <- e
+        └── else: result <- r
 
-### Аннотация сложности
+Get(ctx):
+  select {
+  case <-ctx.Done():  ← отмена
+  case err := <-err:  ← ошибка
+  case r := <-result: ← результат
+  }
+```
 
-| Операция | Time |
-|:---|:---|
-| Connect | ~1-10 мс |
-| Broadcast | ~100-200 нс × N |
-| Ping | ~1-5 мс |
-| Shutdown | 0-5 сек |
+### Проблема: `Get` можно вызвать только один раз
 
-### 💡 Практика: как строить WebSocket-чат
+**Что если нужен результат в нескольких местах?**
+
+```go
+r1, _ := future.Get(ctx)  // OK
+r2, _ := future.Get(ctx)  // ← зависит от реализации
+```
+
+**С текущей реализацией:** второй `Get` вернёт `zero`, потому что канал **уже пуст** (значение прочитано).
+
+### Решение: сохранить результат
+
+```go
+type Future[T any] struct {
+    result chan T
+    err    chan error
+    done   chan struct{}
+    
+    once   sync.Once
+    value  T
+    error  error
+}
+
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    select {
+    case <-ctx.Done():
+        var zero T
+        return zero, ctx.Err()
+    case <-f.done:
+        return f.value, f.error
+    }
+}
+```
+
+**Что даёт:** результат сохраняется. `Get` можно вызывать многократно.
+
+### 💡 Практика: как писать простой future
 
 **✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
 
-1. **Hub** — одна горутина.
-2. **readPump + writePump.**
-3. **Ping/pong.**
-4. **Graceful shutdown.**
+1. **Буферизованные каналы** (буфер 1).
+2. **`defer close`** в горутине.
+3. **`ctx` в `Get`.**
 
 **👍 СТОИТ СДЕЛАТЬ:**
 
-5. **Метрики** — количество клиентов.
-6. **Логирование** подключений.
+4. **Сохранять результат** — если нужен многократный `Get`.
 
 **❌ НЕ ДЕЛАЙ:**
 
-7. **Не блокируйся** на медленном клиенте.
-8. **Не забывай close frame.**
-
-### Ключевые выводы подглавы 20.10
-
-- **Hub** — центральная горутина.
-- **readPump + writePump.**
-- **Ping/pong** каждые 54 сек.
-- **Graceful shutdown** — close + shutdown.
+5. **Не забывай буфер.**
+6. **Не блокируйся без `ctx`.**
 
 ---
 
-## 20.11 Выводы и типичные ошибки
+## 20.3 Future с context
+
+`context` — критичен для future. Без него future может **зависнуть**.
+
+### Проблема
+
+```go
+future := NewFuture(func() (string, error) {
+    time.Sleep(1 * time.Hour)
+    return "result", nil
+})
+
+result, err := future.Get(context.Background())
+// Ждём час
+```
+
+**Что происходит:** future нельзя **отменить**. Даже если клиент ушёл — операция продолжается.
+
+### Решение: context в fn
+
+```go
+future := NewFuture(func(ctx context.Context) (string, error) {
+    select {
+    case <-ctx.Done():
+        return "", ctx.Err()
+    case <-time.After(1 * time.Hour):
+        return "result", nil
+    }
+})
+
+// В Get — передаём ctx
+result, err := future.Get(ctx)
+```
+
+**Что происходит:** future **видит** `ctx.Done()` и завершается.
+
+### Полная реализация
+
+```go
+type Future[T any] struct {
+    fn     func(ctx context.Context) (T, error)
+    result chan T
+    err    chan error
+    ctx    context.Context
+    cancel context.CancelFunc
+}
+
+func NewFuture[T any](parentCtx context.Context, fn func(ctx context.Context) (T, error)) *Future[T] {
+    ctx, cancel := context.WithCancel(parentCtx)
+    
+    f := &Future[T]{
+        fn:     fn,
+        result: make(chan T, 1),
+        err:    make(chan error, 1),
+        ctx:    ctx,
+        cancel: cancel,
+    }
+    
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        
+        r, e := fn(ctx)
+        if e != nil {
+            f.err <- e
+            return
+        }
+        f.result <- r
+    }()
+    
+    return f
+}
+
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    
+    select {
+    case <-ctx.Done():
+        f.cancel()  // отменяем операцию
+        return zero, ctx.Err()
+    case err := <-f.err:
+        return zero, err
+    case r := <-f.result:
+        return r, nil
+    }
+}
+
+func (f *Future[T]) Cancel() {
+    f.cancel()
+}
+```
+
+**Что происходит:**
+
+- `NewFuture` создаёт дочерний `ctx` из `parentCtx`.
+- В `fn` передаётся этот `ctx`.
+- `Get` при отмене вызывает `f.cancel()`.
+- Есть отдельный `Cancel()`.
+
+### Потребитель
+
+```go
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+    defer cancel()
+    
+    future := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        select {
+        case <-ctx.Done():
+            return "", ctx.Err()
+        case <-time.After(2 * time.Second):
+            return "result", nil
+        }
+    })
+    
+    result, err := future.Get(ctx)
+    fmt.Printf("result: %q, err: %v\n", result, err)
+}
+```
+
+**Пример вывода:**
+
+```
+result: "", err: context deadline exceeded
+```
+
+**Что происходит:** через 500 мс `ctx` отменяется. Future возвращает `DeadlineExceeded`.
+
+### Схема
+
+```
+NewFuture(parentCtx, fn):
+  ├── ctx, cancel := WithCancel(parentCtx)
+  ├── result := make(chan T, 1)
+  ├── err := make(chan error, 1)
+  └── go fn(ctx) → result или err
+
+Get(ctx):
+  select {
+  case <-ctx.Done():   ← отмена
+    f.cancel()
+    return ctx.Err()
+  case err := <-err:
+  case r := <-result:
+  }
+```
+
+### 💡 Практика: как добавить context
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`parentCtx` — первый аргумент `NewFuture`.**
+2. **`fn(ctx)` — передавай ctx в callback.**
+3. **`f.cancel()` при отмене `Get`.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Метод `Cancel()`** для явной отмены.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не блокируйся без `ctx`.**
+6. **Не забывай `f.cancel()`.**
+
+---
+
+## 20.4 Future с ошибками
+
+Future может завершиться **ошибкой**. Разберём, как её обрабатывать.
+
+### Простой способ: результат + ошибка
+
+Мы уже это делаем: `result` и `err` каналы.
+
+```go
+select {
+case <-ctx.Done():
+    return zero, ctx.Err()
+case err := <-f.err:
+    return zero, err
+case r := <-f.result:
+    return r, nil
+}
+```
+
+### Проблема: читаем из обоих каналов
+
+**Что если `fn` вернул ошибку, но мы читаем из `result`?**
+
+```go
+r := <-f.result  // ← получим zero
+```
+
+**Решение:** `Get` читает из обоих каналов через `select`.
+
+### Паника в fn
+
+**Что если `fn` паникует?**
+
+```go
+func NewFuture[T any](parentCtx context.Context, fn func(ctx context.Context) (T, error)) *Future[T] {
+    // ...
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        
+        defer func() {
+            if r := recover(); r != nil {
+                f.err <- fmt.Errorf("panic: %v", r)
+            }
+        }()
+        
+        r, e := fn(ctx)
+        // ...
+    }()
+    // ...
+}
+```
+
+**Что даёт:** паника превращается в ошибку.
+
+### Ошибки с типом
+
+```go
+type Result[T any] struct {
+    Value T
+    Err   error
+}
+
+func (r Result[T]) Ok() bool {
+    return r.Err == nil
+}
+```
+
+**Что даёт:** один канал для результата и ошибки.
+
+### Полный пример
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "time"
+)
+
+type Future[T any] struct {
+    result chan T
+    err    chan error
+    ctx    context.Context
+    cancel context.CancelFunc
+}
+
+func NewFuture[T any](parentCtx context.Context, fn func(ctx context.Context) (T, error)) *Future[T] {
+    ctx, cancel := context.WithCancel(parentCtx)
+    
+    f := &Future[T]{
+        result: make(chan T, 1),
+        err:    make(chan error, 1),
+        ctx:    ctx,
+        cancel: cancel,
+    }
+    
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        
+        defer func() {
+            if r := recover(); r != nil {
+                f.err <- fmt.Errorf("panic: %v", r)
+            }
+        }()
+        
+        r, e := fn(ctx)
+        if e != nil {
+            f.err <- e
+            return
+        }
+        f.result <- r
+    }()
+    
+    return f
+}
+
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    
+    select {
+    case <-ctx.Done():
+        f.cancel()
+        return zero, ctx.Err()
+    case err := <-f.err:
+        return zero, err
+    case r := <-f.result:
+        return r, nil
+    }
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    // Успешный future
+    f1 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        return "hello", nil
+    })
+    r, err := f1.Get(ctx)
+    fmt.Printf("f1: %q, %v\n", r, err)
+    
+    // Future с ошибкой
+    f2 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        return "", errors.New("something failed")
+    })
+    r, err = f2.Get(ctx)
+    fmt.Printf("f2: %q, %v\n", r, err)
+    
+    // Future с паникой
+    f3 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        panic("boom")
+    })
+    r, err = f3.Get(ctx)
+    fmt.Printf("f3: %q, %v\n", r, err)
+}
+```
+
+**Пример вывода:**
+
+```
+f1: "hello", <nil>
+f2: "", something failed
+f3: "", panic: boom
+```
+
+### 💡 Практика: как обрабатывать ошибки
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Два канала** — для результата и ошибки.
+2. **`recover`** в горутине.
+3. **`select`** в `Get`.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Тип `Result[T]`** для сложных случаев.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не игнорируй паники.**
+6. **Не путай ошибки с результатом.**
+
+---
+
+## 20.5 Комбинирование future'ов
+
+Иногда нужно **несколько** future'ов объединить.
+
+### WaitAll: все результаты
+
+```go
+func WaitAll[T any](ctx context.Context, futures []*Future[T]) ([]T, error) {
+    results := make([]T, len(futures))
+    
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    var firstErr error
+    
+    for i, f := range futures {
+        i, f := i, f
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            r, err := f.Get(ctx)
+            if err != nil {
+                mu.Lock()
+                if firstErr == nil {
+                    firstErr = err
+                }
+                mu.Unlock()
+                return
+            }
+            mu.Lock()
+            results[i] = r
+            mu.Unlock()
+        }()
+    }
+    
+    wg.Wait()
+    return results, firstErr
+}
+```
+
+**Что даёт:** ждём **все** future'ы. Возвращаем все результаты или первую ошибку.
+
+### WaitAny: первый результат
+
+```go
+func WaitAny[T any](ctx context.Context, futures []*Future[T]) (T, error) {
+    type result struct {
+        value T
+        err   error
+    }
+    
+    ch := make(chan result, len(futures))
+    
+    for _, f := range futures {
+        f := f
+        go func() {
+            r, err := f.Get(ctx)
+            ch <- result{value: r, err: err}
+        }()
+    }
+    
+    select {
+    case r := <-ch:
+        return r.value, r.err
+    case <-ctx.Done():
+        var zero T
+        return zero, ctx.Err()
+    }
+}
+```
+
+**Что даёт:** ждём **первый** завершившийся future.
+
+### Пример: параллельные запросы
+
+```go
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    // Запускаем 3 запроса параллельно
+    f1 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        time.Sleep(100 * time.Millisecond)
+        return "profile", nil
+    })
+    
+    f2 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        time.Sleep(200 * time.Millisecond)
+        return "orders", nil
+    })
+    
+    f3 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        time.Sleep(150 * time.Millisecond)
+        return "recommendations", nil
+    })
+    
+    start := time.Now()
+    results, err := WaitAll(ctx, []*Future[string]{f1, f2, f3})
+    fmt.Printf("WaitAll: %v, err: %v, elapsed: %v\n", results, err, time.Since(start))
+    
+    // Или первый
+    f4 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        time.Sleep(50 * time.Millisecond)
+        return "fast", nil
+    })
+    f5 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        time.Sleep(200 * time.Millisecond)
+        return "slow", nil
+    })
+    
+    start = time.Now()
+    result, err := WaitAny(ctx, []*Future[string]{f4, f5})
+    fmt.Printf("WaitAny: %q, err: %v, elapsed: %v\n", result, err, time.Since(start))
+}
+```
+
+**Пример вывода:**
+
+```
+WaitAll: [profile orders recommendations], err: <nil>, elapsed: 200ms
+WaitAny: "fast", err: <nil>, elapsed: 50ms
+```
+
+**Что видно:**
+
+- `WaitAll` ждёт 200 мс (самый долгий).
+- `WaitAny` возвращает через 50 мс (первый).
+
+### 💡 Практика: как комбинировать future'ы
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **`WaitAll` — для всех результатов.**
+2. **`WaitAny` — для первого.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **`ctx` — для отмены всех.**
+4. **`sync.WaitGroup` + `Mutex` для `WaitAll`.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не забывай про гонки.**
+6. **Не блокируйся без `ctx`.**
+
+---
+
+## 20.6 Future vs горутина + канал
+
+Разберём **разницу** между future и горутина + канал.
+
+### Горутина + канал
+
+```go
+resultCh := make(chan string, 1)
+go func() {
+    r, err := fetch()
+    if err != nil {
+        resultCh <- ""
+        return
+    }
+    resultCh <- r
+}()
+
+// Позже
+result := <-resultCh
+```
+
+**Что даёт:** запуск в фоне, получение через канал.
+
+### Future
+
+```go
+future := NewFuture(ctx, func(ctx context.Context) (string, error) {
+    return fetch(ctx)
+})
+
+// Позже
+result, err := future.Get(ctx)
+```
+
+**Что даёт:** абстракция. Инкапсулирует каналы, ошибки, отмену.
+
+### Сравнение
+
+| Аспект | Горутина + канал | Future |
+|:---|:---|:---|
+| Каналы | Ручные | Скрытые |
+| Ошибки | Ручные | Встроенные |
+| Отмена | Через `ctx` вручную | Через `Get` или `Cancel` |
+| Композиция | Вручную | `WaitAll` / `WaitAny` |
+| Многоразовый `Get` | Нет | Да (если сохранить результат) |
+
+### Что выбрать
+
+**Горутина + канал:**
+
+- **Один вызов.**
+- **Простая логика.**
+- **Не нужна абстракция.**
+
+**Future:**
+
+- **Много вызовов.**
+- **Композиция.**
+- **Асинхронный API.**
+
+### 💡 Практика: как выбирать
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Горутина + канал — для простого.**
+2. **Future — для сложного.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+3. **Future в кэше** — избегает дублирования.
+
+**❌ НЕ ДЕЛАЙ:**
+
+4. **Не используй future для одного вызова.**
+
+---
+
+## 20.7 В связке с другими паттернами
+
+Future редко используется **в одиночку**. Разберём связки.
+
+### Future + worker pool
+
+**Future для параллельных запросов:**
+
+```go
+func fetchAll(ctx context.Context, ids []int) ([]User, error) {
+    futures := make([]*Future[User], len(ids))
+    for i, id := range ids {
+        id := id
+        futures[i] = NewFuture(ctx, func(ctx context.Context) (User, error) {
+            return fetchUser(ctx, id)
+        })
+    }
+    return WaitAll(ctx, futures)
+}
+```
+
+### Future + pipeline
+
+**Future как стадия pipeline:**
+
+```go
+func enrichStage(ctx context.Context, input <-chan int) <-chan Enriched {
+    out := make(chan Enriched)
+    
+    go func() {
+        defer close(out)
+        for v := range input {
+            future := NewFuture(ctx, func(ctx context.Context) (Enriched, error) {
+                return enrich(ctx, v)
+            })
+            result, err := future.Get(ctx)
+            if err != nil {
+                continue
+            }
+            select {
+            case out <- result:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+    
+    return out
+}
+```
+
+### Future + cache
+
+**Future в кэше — избегает дублирования:**
+
+```go
+type Cache struct {
+    mu      sync.Mutex
+    futures map[string]*Future[User]
+}
+
+func (c *Cache) Get(ctx context.Context, id string) (User, error) {
+    c.mu.Lock()
+    f, ok := c.futures[id]
+    if !ok {
+        f = NewFuture(ctx, func(ctx context.Context) (User, error) {
+            return fetchUser(ctx, id)
+        })
+        c.futures[id] = f
+    }
+    c.mu.Unlock()
+    
+    return f.Get(ctx)
+}
+```
+
+**Что даёт:** если два клиента запрашивают одного пользователя **одновременно** — один запрос.
+
+### Схема
+
+```
+Первый запрос:
+  c.futures["42"] = NewFuture(...)
+  → f.Get(ctx)
+
+Второй запрос (одновременно):
+  c.futures["42"] уже есть
+  → f.Get(ctx) ← тот же future
+
+Результат: один запрос к БД, два клиента получают результат.
+```
+
+### 💡 Практика: как комбинировать future
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Future + worker pool** — параллельные запросы.
+2. **Future + pipeline** — стадия pipeline.
+3. **Future + cache** — избегает дублирования.
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **`WaitAll` / `WaitAny`** для композиции.
+
+**❌ НЕ ДЕЛАЙ:**
+
+5. **Не забывай `ctx`.**
+
+---
+
+## 20.8 Практика Go: future с метриками
+
+Разберём **future с метриками**.
+
+### Полный код
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "fmt"
+    "sync"
+    "sync/atomic"
+    "time"
+)
+
+type Metrics struct {
+    Started    atomic.Int64
+    Completed  atomic.Int64
+    Failed     atomic.Int64
+    Canceled   atomic.Int64
+    TotalTime  atomic.Int64
+}
+
+type Future[T any] struct {
+    result chan T
+    err    chan error
+    ctx    context.Context
+    cancel context.CancelFunc
+    start  time.Time
+    metrics *Metrics
+}
+
+func NewFuture[T any](parentCtx context.Context, fn func(ctx context.Context) (T, error), metrics *Metrics) *Future[T] {
+    ctx, cancel := context.WithCancel(parentCtx)
+    
+    f := &Future[T]{
+        result:  make(chan T, 1),
+        err:     make(chan error, 1),
+        ctx:     ctx,
+        cancel:  cancel,
+        start:   time.Now(),
+        metrics: metrics,
+    }
+    
+    metrics.Started.Add(1)
+    
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        
+        defer func() {
+            if r := recover(); r != nil {
+                f.err <- fmt.Errorf("panic: %v", r)
+            }
+        }()
+        
+        r, e := fn(ctx)
+        if e != nil {
+            f.err <- e
+            return
+        }
+        f.result <- r
+    }()
+    
+    return f
+}
+
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    
+    select {
+    case <-ctx.Done():
+        f.cancel()
+        f.metrics.Canceled.Add(1)
+        return zero, ctx.Err()
+    case err := <-f.err:
+        f.metrics.Failed.Add(1)
+        f.metrics.TotalTime.Add(int64(time.Since(f.start)))
+        if errors.Is(err, context.Canceled) {
+            f.metrics.Canceled.Add(1)
+        }
+        return zero, err
+    case r := <-f.result:
+        f.metrics.Completed.Add(1)
+        f.metrics.TotalTime.Add(int64(time.Since(f.start)))
+        return r, nil
+    }
+}
+
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    metrics := &Metrics{}
+    
+    // 3 успешных
+    futures := []*Future[string]{
+        NewFuture(ctx, func(ctx context.Context) (string, error) {
+            time.Sleep(100 * time.Millisecond)
+            return "a", nil
+        }, metrics),
+        NewFuture(ctx, func(ctx context.Context) (string, error) {
+            time.Sleep(150 * time.Millisecond)
+            return "b", nil
+        }, metrics),
+        NewFuture(ctx, func(ctx context.Context) (string, error) {
+            time.Sleep(200 * time.Millisecond)
+            return "c", nil
+        }, metrics),
+    }
+    
+    // Один с ошибкой
+    f4 := NewFuture(ctx, func(ctx context.Context) (string, error) {
+        return "", errors.New("failed")
+    }, metrics)
+    
+    for _, f := range futures {
+        f.Get(ctx)
+    }
+    f4.Get(ctx)
+    
+    fmt.Println("=== Metrics ===")
+    fmt.Printf("Started:   %d\n", metrics.Started.Load())
+    fmt.Printf("Completed: %d\n", metrics.Completed.Load())
+    fmt.Printf("Failed:    %d\n", metrics.Failed.Load())
+    fmt.Printf("Canceled:  %d\n", metrics.Canceled.Load())
+    fmt.Printf("TotalTime: %v\n", time.Duration(metrics.TotalTime.Load()))
+}
+```
+
+**Пример вывода:**
+
+```
+=== Metrics ===
+Started:   4
+Completed: 3
+Failed:    1
+Canceled:  0
+TotalTime: 450ms
+```
+
+**Что демонстрирует:** метрики по future — started, completed, failed, canceled.
+
+### Пример: WaitAll с метриками
+
+```go
+func WaitAll[T any](ctx context.Context, futures []*Future[T]) ([]T, error) {
+    results := make([]T, len(futures))
+    
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    var firstErr error
+    
+    for i, f := range futures {
+        i, f := i, f
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            r, err := f.Get(ctx)
+            if err != nil {
+                mu.Lock()
+                if firstErr == nil {
+                    firstErr = err
+                }
+                mu.Unlock()
+                return
+            }
+            mu.Lock()
+            results[i] = r
+            mu.Unlock()
+        }()
+    }
+    
+    wg.Wait()
+    return results, firstErr
+}
+```
+
+### 💡 Практика: как измерять future
+
+**✅ ОБЯЗАТЕЛЬНО ДЕЛАЙ:**
+
+1. **Метрики:** started, completed, failed, canceled.
+2. **TotalTime** — суммарное время.
+3. **Экспорт в Prometheus.**
+
+**👍 СТОИТ СДЕЛАТЬ:**
+
+4. **Различай failed и canceled.**
+5. **Percentile latency.**
+
+**❌ НЕ ДЕЛАЙ:**
+
+6. **Не используй `Mutex` для метрик.**
+
+---
+
+## 20.9 Выводы и типичные ошибки
 
 **Что мы узнали?**
 
-HTTP не подходит для real-time. WebSocket — bidirectional. SSE — сервер → клиент. gRPC streaming — для микросервисов. Hub-паттерн — для WebSocket. Backpressure — критичен. Heartbeat — ping/pong. Graceful shutdown — close + shutdown. Масштабирование — pub/sub.
+Future — объект, представляющий результат в будущем. **Простейший** — два канала (result + err), горутина, `Get(ctx)`. **`context`** для отмены. **Ошибки** — через отдельный канал или `Result[T]`. **`recover`** для паник. **`WaitAll` / `WaitAny`** для композиции. Future + cache для избежания дублирования. Future + worker pool для параллельных запросов.
 
 **Типичные ошибки:**
 
-- ❌ **Polling для real-time.** Latency.
-- ❌ **Mutex для клиентов.** Hub лучше.
-- ❌ **Блокировка на медленном клиенте.** Backpressure.
-- ❌ **Без heartbeat.** Мёртвые соединения.
-- ❌ **Без graceful shutdown.** Клиенты отключаются.
-- ❌ **Без backoff reconnect.** Thundering herd.
-- ❌ **Stateful без pub/sub.** Не масштабируется.
-- ❌ **`golang.org/x/net/websocket`.** Устаревшая.
-- ❌ **Не обрабатывать `io.EOF`.** Ошибки.
-- ❌ **Игнорировать close codes.**
+- ❌ **Небуферизованные каналы.** Горутина зависнет, если `Get` не вызывается.
+- ❌ **Не использовать `ctx`.** Зависание.
+- ❌ **Игнорировать паники.** Future не вернёт ошибку.
+- ❌ **Многоразовый `Get` без сохранения результата.**
+- ❌ **Не различать failed и canceled.**
+- ❌ **Гонки в `WaitAll`.** `Mutex` для `firstErr`.
+- ❌ **Future в кэше без синхронизации.**
+- ❌ **Использовать future для одного вызова.**
 
 ---
 
-## 20.12 Для быстрого повторения
+## 20.10 Для быстрого повторения
 
-- **HTTP request/response** — инициатива у клиента.
-- **Polling** — latency, пустые запросы.
-- **WebSocket** — bidirectional, frame-based.
-- **Handshake** через HTTP Upgrade.
-- **Ping/pong** — heartbeat.
-- **SSE** — сервер → клиент, `text/event-stream`.
-- **gRPC streaming** — 3 типа, HTTP/2.
-- **Hub** — одна горутина, map без Mutex.
-- **Client** — readPump + writePump.
-- **Backpressure** — non-blocking send.
-- **Drop или disconnect** — стратегии.
-- **Heartbeat** — 30-60 сек.
-- **Reconnect** — с backoff.
-- **Graceful shutdown** — close + shutdown.
-- **Масштабирование** — pub/sub.
-- **Redis Pub/Sub** или **NATS**.
-- **Sticky sessions** или stateless.
-- **`nhooyr/coder/websocket`** — рекомендуется.
+- **Future** — результат в будущем.
+- **`NewFuture(ctx, fn)`** — создать.
+- **`Get(ctx)`** — получить результат.
+- **Буферизованные каналы** (буфер 1).
+- **`recover`** — для паник.
+- **`ctx`** — для отмены.
+- **`WaitAll`** — все результаты.
+- **`WaitAny`** — первый.
+- **Future + cache** — избегает дублирования.
+- **Future + worker pool** — параллельные запросы.
+- **Метрики:** started, completed, failed, canceled.
 
 ---
 
-## 20.13 Вопросы для самопроверки
+## 20.11 Вопросы для самопроверки
 
-1. Почему HTTP не подходит для real-time?
-2. Что такое WebSocket?
-3. Как работает handshake?
-4. Что такое ping/pong?
-5. Что такое hub-паттерн?
-6. Зачем readPump + writePump?
-7. Что такое SSE?
-8. Чем SSE отличается от WebSocket?
-9. Что такое gRPC streaming?
-10. Какие 3 типа streaming?
-11. Что такое backpressure в streaming?
-12. Какие стратегии backpressure?
-13. Что такое heartbeat?
-14. Как делать reconnect?
-15. Как делать graceful shutdown для streaming?
-16. Как масштабировать streaming?
-17. Что такое Redis Pub/Sub?
-18. Почему `nhooyr/coder/websocket` рекомендуется?
+1. Что такое future? Какую задачу решает?
+2. Как построить простейший future?
+3. Почему буферизованные каналы?
+4. Зачем `ctx` в future?
+5. Как обрабатывать паники в future?
+6. Что такое `WaitAll` и `WaitAny`?
+7. Как future помогает с кэшем?
+8. Что выбрать — future или горутина + канал?
 
 ---
 
-## 20.14 Ответы
+## 20.12 Ответы
 
 ### Ответ 1
 
-**HTTP** — инициатива у клиента. Сервер не может отправить данные без запроса. Polling даёт latency и пустые запросы.
+**Future** — объект, представляющий результат в будущем. Решает задачу: **запустить операцию в фоне, получить результат позже**.
+
+**Пример:** параллельные запросы к БД + API.
 
 ### Ответ 2
 
-**WebSocket** — bidirectional, frame-based протокол поверх HTTP Upgrade.
+```go
+type Future[T any] struct {
+    result chan T
+    err    chan error
+}
+
+func NewFuture[T any](fn func() (T, error)) *Future[T] {
+    f := &Future[T]{
+        result: make(chan T, 1),
+        err:    make(chan error, 1),
+    }
+    go func() {
+        defer close(f.result)
+        defer close(f.err)
+        r, e := fn()
+        if e != nil {
+            f.err <- e
+            return
+        }
+        f.result <- r
+    }()
+    return f
+}
+
+func (f *Future[T]) Get(ctx context.Context) (T, error) {
+    var zero T
+    select {
+    case <-ctx.Done():
+        return zero, ctx.Err()
+    case err := <-f.err:
+        return zero, err
+    case r := <-f.result:
+        return r, nil
+    }
+}
+```
 
 ### Ответ 3
 
-**Handshake:** клиент отправляет HTTP-запрос с `Upgrade: websocket`. Сервер отвечает `101 Switching Protocols`. Соединение становится WebSocket.
+**Буферизованные каналы** (буфер 1) позволяют горутине **записать результат** и **завершиться**, даже если никто не читал.
+
+**Без буфера:** горутина зависнет на `f.result <- r`, если `Get` не вызывается. **Утечка.**
 
 ### Ответ 4
 
-**Ping/pong** — heartbeat. Сервер отправляет ping, клиент отвечает pong. Проверяет живость.
+**`ctx`** позволяет отменить операцию. Без него future может **зависнуть**, даже если клиент ушёл.
+
+**Решение:** `NewFuture(parentCtx, fn)` + `fn(ctx)`.
 
 ### Ответ 5
 
-**Hub-паттерн** — центральная горутина, которая управляет клиентами. Register, unregister, broadcast через каналы.
+**`recover` в горутине:**
+
+```go
+go func() {
+    defer close(f.result)
+    defer close(f.err)
+    
+    defer func() {
+        if r := recover(); r != nil {
+            f.err <- fmt.Errorf("panic: %v", r)
+        }
+    }()
+    
+    r, e := fn(ctx)
+    // ...
+}()
+```
 
 ### Ответ 6
 
-**readPump** — читает от клиента. **writePump** — пишет клиенту. Разделение позволяет обрабатывать параллельно.
+**`WaitAll`** — ждём **все** future'ы. Возвращаем все результаты или первую ошибку.
+
+**`WaitAny`** — ждём **первый** завершившийся. Возвращаем его результат.
 
 ### Ответ 7
 
-**SSE** — Server-Sent Events. Push от сервера через HTTP.
+**Future в кэше:**
+
+```go
+type Cache struct {
+    mu      sync.Mutex
+    futures map[string]*Future[User]
+}
+
+func (c *Cache) Get(ctx context.Context, id string) (User, error) {
+    c.mu.Lock()
+    f, ok := c.futures[id]
+    if !ok {
+        f = NewFuture(ctx, func(ctx context.Context) (User, error) {
+            return fetchUser(ctx, id)
+        })
+        c.futures[id] = f
+    }
+    c.mu.Unlock()
+    return f.Get(ctx)
+}
+```
+
+Если два клиента запрашивают одного пользователя **одновременно** — **один** запрос к БД.
 
 ### Ответ 8
 
-**SSE** — односторонний (сервер → клиент). **WebSocket** — bidirectional.
+**Горутина + канал:**
 
-### Ответ 9
+- Один вызов.
+- Простая логика.
+- Не нужна абстракция.
 
-**gRPC streaming** — потоки поверх HTTP/2.
+**Future:**
 
-### Ответ 10
+- Много вызовов.
+- Композиция.
+- Асинхронный API.
 
-**3 типа:** server streaming, client streaming, bidirectional.
-
-### Ответ 11
-
-**Backpressure** — медленный consumer замедляет producer.
-
-### Ответ 12
-
-**Стратегии:** drop oldest, drop newest, block, disconnect.
-
-### Ответ 13
-
-**Heartbeat** — периодические сообщения для проверки живости.
-
-### Ответ 14
-
-**Reconnect** — с exponential backoff.
-
-### Ответ 15
-
-**Graceful shutdown:** close frame для WebSocket, `r.Context()` для SSE, `GracefulStop` для gRPC.
-
-### Ответ 16
-
-**Масштабирование** через pub/sub (Redis, NATS).
-
-### Ответ 17
-
-**Redis Pub/Sub** — механизм publish/subscribe для broadcast между серверами.
-
-### Ответ 18
-
-**`nhooyr/coder/websocket`** — context-aware, современный, активно поддерживается.
+**Future** для сложного, **горутина + канал** для простого.
 
 ---
 
-## 20.15 Куда идти дальше?
+## 20.13 Куда идти дальше?
 
-Мы разобрали WebSocket, SSE, gRPC streaming. Теперь мы умеем строить real-time сервисы.
+Мы разобрали future — результат в будущем. Теперь мы умеем запускать операции в фоне и получать результат позже.
 
-Но остаётся **следующая тема**: как писать **безопасный** конкурентный код?
+Но остаются **продвинутые паттерны**: bulkhead, leader election, sharded locks.
 
-- **Как писать безопасный конкурентный код?** TOCTOU, timing attacks, DoS через горутины. → **Глава 21: Безопасность конкурентного кода.**
-- **Как строить распределённые системы?** CAP, consensus. → **Глава 22: Распределённые системы — введение.**
-- **Как работает Raft?** → **Глава 23: Consensus — Raft и Paxos.**
+- **Как построить bulkhead?** → **Глава 22: Bulkhead.**
+- **Как построить leader election?** → **Глава 24: Leader election.**
+- **Как разбить лок на шарды?** → **Глава 25: Sharded locks.**
 
 ---
 
-## 20.16 Чек-лист
+## 20.14 Чек-лист
 
 | Компонент | Что это | Ключевые факты |
 |:---|:---|:---|
-| **Polling** | HTTP-запросы | Latency, пустые |
-| **WebSocket** | Bidirectional | Frame-based, WS |
-| **Handshake** | Upgrade | HTTP 101 |
-| **Ping/pong** | Heartbeat | 30-60 сек |
-| **SSE** | Server → Client | `text/event-stream` |
-| **gRPC streaming** | Потоки | HTTP/2 |
-| **Hub** | Центральная горутина | Map без Mutex |
-| **readPump** | Чтение | От клиента |
-| **writePump** | Запись | К клиенту |
-| **Backpressure** | Замедление | Non-blocking send |
-| **Drop/disconnect** | Стратегии | Для медленных |
-| **Reconnect** | Переподключение | Backoff |
-| **Graceful shutdown** | Close + shutdown | Таймаут |
-| **Pub/sub** | Масштабирование | Redis, NATS |
-| **Sticky sessions** | Привязка | Или stateless |
-| **`nhooyr/coder`** | Библиотека | Рекомендуется |
+| **Future** | Результат в будущем | `NewFuture(ctx, fn)` |
+| **`Get(ctx)`** | Получить результат | Блокируется или `ctx.Done()` |
+| **Буферизованные каналы** | Буфер 1 | Иначе утечка |
+| **`recover`** | Для паник | В горутине |
+| **`ctx`** | Отмена | `parentCtx` в `NewFuture` |
+| **`WaitAll`** | Все результаты | `sync.WaitGroup` + `Mutex` |
+| **`WaitAny`** | Первый | `select` на канал |
+| **Future + cache** | Избегает дублирования | `Mutex` для map |
+| **Future + worker pool** | Параллельные запросы | `WaitAll` |
+| **Метрики** | started, completed, failed, canceled | `atomic.Int64` |
 
-🌐 **Ключевая идея:** HTTP request/response не подходит для real-time — нужен push от сервера. **WebSocket** — bidirectional, frame-based. **Handshake** через HTTP Upgrade. **Ping/pong** — heartbeat. **SSE** — сервер → клиент, `text/event-stream`, auto-reconnect. **gRPC streaming** — 3 типа, HTTP/2, flow control. **Hub-паттерн** — центральная горутина, map без Mutex. **Client** — readPump + writePump. **Backpressure** — non-blocking send; drop или disconnect. **Heartbeat** — 30-60 сек. **Reconnect** — с backoff. **Graceful shutdown** — close + shutdown. **Масштабирование** через pub/sub (Redis, NATS) и sticky sessions. **`nhooyr/coder/websocket`** — рекомендуется для новых проектов.
+🔮 **Ключевая идея:** Future — объект, представляющий результат в будущем. **Простейший** — два канала (result + err), горутина, `Get(ctx)`. **Буферизованные каналы** обязательны. **`ctx`** для отмены. **`recover`** для паник. **`WaitAll` / `WaitAny`** для композиции. Future + cache для избежания дублирования (один запрос — много клиентов). Future + worker pool для параллельных запросов. Метрики: started, completed, failed, canceled. Не используй future для одного вызова — горутина + канал проще.
